@@ -1,0 +1,8 @@
+# vocabulary_learner 依赖
+# 基于 english conda 环境的已测试版本
+
+streamlit==1.51.0
+openai==2.8.0
+pandas==2.3.3
+plotly==6.4.0
+numpy==2.3.4

@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+.pytest_cache/
+.coverage
+.venv/
+venv/
+
+# Local environment files may contain endpoint credentials.
+.env
+.env.*
+!.env.example
+
+# Local learning state and API credentials.
+data/
+.streamlit/secrets.toml
+.streamlit/credentials.toml
