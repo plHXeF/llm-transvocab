@@ -9,6 +9,7 @@ from typing import Iterable, Mapping
 
 from domain import (
     DEFAULT_STABILITY_DAYS,
+    MIN_DIFFICULTY_SAMPLES,
     Card,
     Progress,
     ScheduledCard,
@@ -19,6 +20,8 @@ from domain import (
 
 DEFAULT_BATCH_SIZE = 20
 MIN_REVIEW_FRACTION = 0.25
+DIFFICULTY_PRIORITY_SCALE = 0.30
+MAX_DIFFICULTY_PRIORITY_BONUS = 0.15
 
 
 def retention_for(progress: Progress | None, *, now: datetime | None = None) -> float:
@@ -42,7 +45,7 @@ def retention_for(progress: Progress | None, *, now: datetime | None = None) -> 
 
 
 def priority_for(progress: Progress | None, *, now: datetime | None = None) -> float:
-    """Return review urgency as one minus predicted effective mastery."""
+    """Return forgetting urgency plus a capped, evidence-gated difficulty bonus."""
 
     if progress is None or progress.attempts <= 0:
         return 1.0
@@ -51,7 +54,17 @@ def priority_for(progress: Progress | None, *, now: datetime | None = None) -> f
         mastery = 0.0
     mastery = min(1.0, max(0.0, float(mastery)))
     effective_mastery = mastery * retention_for(progress, now=now)
-    return min(1.0, max(0.0, 1.0 - effective_mastery))
+    base_priority = min(1.0, max(0.0, 1.0 - effective_mastery))
+    if progress.difficulty_samples < MIN_DIFFICULTY_SAMPLES:
+        return base_priority
+    difficulty = progress.difficulty
+    if not isinstance(difficulty, (int, float)) or not math.isfinite(difficulty):
+        return base_priority
+    difficulty_bonus = min(
+        MAX_DIFFICULTY_PRIORITY_BONUS,
+        max(0.0, (float(difficulty) - 0.5) * DIFFICULTY_PRIORITY_SCALE),
+    )
+    return base_priority + difficulty_bonus
 
 
 def rank_cards(

@@ -15,6 +15,7 @@ from llm_service import (
     ReasoningEffort,
     RETRY_OUTPUT_TOKEN_INCREMENT,
     SENTENCE_PROMPT_VERSION,
+    SentenceDifficulty,
     STRUCTURED_RESPONSE_MAX_RETRIES,
     VOCAB_IMPORT_PROMPT_VERSION,
     VOCAB_IMPORT_OUTPUT_TOKENS,
@@ -118,6 +119,34 @@ class StructuredTaskTests(unittest.TestCase):
         self.assertEqual(kwargs["reasoning_effort"], "none")
         self.assertNotIn("temperature", kwargs)
         self.assertIn(SENTENCE_PROMPT_VERSION, kwargs["messages"][0]["content"])
+        self.assertIn("[difficulty:cet6_postgrad]", kwargs["messages"][0]["content"])
+
+    def test_each_sentence_difficulty_uses_its_own_exam_profile(self):
+        expectations = {
+            SentenceDifficulty.JUNIOR_HIGH: ("[difficulty:junior_high]", "8–15"),
+            SentenceDifficulty.GAOKAO_CET4: ("[difficulty:gaokao_cet4]", "12–22"),
+            SentenceDifficulty.CET6_POSTGRAD: (
+                "[difficulty:cet6_postgrad]",
+                "18–30",
+            ),
+            SentenceDifficulty.IELTS: ("[difficulty:ielts]", "18–32"),
+        }
+        for difficulty, expected in expectations.items():
+            with self.subTest(difficulty=difficulty.value):
+                client = mock_client(
+                    '{"english_sentence":"We abandon this plan today.",'
+                    '"chinese_translation":"我们今天放弃这个计划。"}'
+                )
+                LLMService(self.settings, client=client).generate_sentence(
+                    Card("abandon", "v", "放弃"),
+                    difficulty=difficulty,
+                )
+                call = client.chat.completions.create.call_args.kwargs
+                system_prompt = call["messages"][0]["content"]
+                user_prompt = call["messages"][1]["content"]
+                self.assertIn(expected[0], system_prompt)
+                self.assertIn(expected[1], system_prompt)
+                self.assertIn(f"difficulty={difficulty.value}", user_prompt)
 
     def test_invalid_first_json_is_repaired_exactly_once(self):
         client = mock_client(
@@ -129,6 +158,32 @@ class StructuredTaskTests(unittest.TestCase):
         )
         self.assertIn("abandon", result.english_sentence)
         self.assertEqual(client.chat.completions.create.call_count, 2)
+        repair_prompt = client.chat.completions.create.call_args_list[1].kwargs[
+            "messages"
+        ][1]["content"]
+        self.assertIn("original_task", repair_prompt)
+        self.assertIn("abandon", repair_prompt)
+
+    def test_sentence_accepts_standard_inflection_of_target_word(self):
+        client = mock_client(
+            '{"english_sentence":"The quiet garden appeals to tired commuters.",'
+            '"chinese_translation":"这座安静的花园吸引着疲惫的通勤者。"}'
+        )
+        result = LLMService(self.settings, client=client).generate_sentence(
+            Card("appeal", "v", "有吸引力")
+        )
+        self.assertIn("appeals", result.english_sentence)
+        self.assertEqual(client.chat.completions.create.call_count, 1)
+
+    def test_sentence_accepts_common_irregular_inflection(self):
+        client = mock_client(
+            '{"english_sentence":"The practical design made the tool popular.",'
+            '"chinese_translation":"实用的设计使这个工具广受欢迎。"}'
+        )
+        result = LLMService(self.settings, client=client).generate_sentence(
+            Card("make", "v", "使得")
+        )
+        self.assertIn("made", result.english_sentence)
 
     def test_target_word_validation_uses_letter_boundaries(self):
         client = mock_client(
@@ -201,14 +256,44 @@ class StructuredTaskTests(unittest.TestCase):
         self.assertEqual(error.request_id, "request-3")
 
     def test_evaluation_uses_source_as_authority(self):
-        client = mock_client('{"score":88,"feedback":"准确自然。"}')
+        client = mock_client(
+            '{"score":88,"feedback":"准确自然。",'
+            '"target_error_weight":0.2,"attribution_confidence":0.9,'
+            '"non_target_error_tags":["chinese_expression"]}'
+        )
+        card = Card("sound", "adj", "合理的；可靠的")
         result = LLMService(self.settings, client=client).evaluate_translation(
-            "The proposal is sound.", "这个提议是合理的。", "这个方案很可靠。"
+            "The proposal is sound.",
+            "这个提议是合理的。",
+            "这个方案很可靠。",
+            card=card,
         )
         self.assertEqual(result.score, 88)
+        self.assertEqual(result.target_error_weight, 0.2)
+        self.assertEqual(result.attribution_confidence, 0.9)
+        self.assertEqual(result.non_target_error_tags, ("chinese_expression",))
         self.assertEqual(result.prompt_version, EVALUATION_PROMPT_VERSION)
-        prompt = client.chat.completions.create.call_args.kwargs["messages"][0]["content"]
-        self.assertIn("参考译文只是一个可接受版本", prompt)
+        call = client.chat.completions.create.call_args.kwargs
+        self.assertIn("参考译文只是一个可接受版本", call["messages"][0]["content"])
+        self.assertIn("合理的；可靠的", call["messages"][1]["content"])
+
+    def test_invalid_error_attribution_is_retried(self):
+        client = mock_client(
+            '{"score":40,"feedback":"错误",'
+            '"target_error_weight":1.5,"attribution_confidence":0.9,'
+            '"non_target_error_tags":[]}',
+            '{"score":40,"feedback":"目标词义理解错误。",'
+            '"target_error_weight":0.95,"attribution_confidence":0.9,'
+            '"non_target_error_tags":[]}',
+        )
+        result = LLMService(self.settings, client=client).evaluate_translation(
+            "The proposal is sound.",
+            "这个提议是合理的。",
+            "这个提议声音很大。",
+            card=Card("sound", "adj", "合理的"),
+        )
+        self.assertEqual(result.target_error_weight, 0.95)
+        self.assertEqual(client.chat.completions.create.call_count, 2)
 
     def test_vocab_import_returns_typed_preview_data(self):
         client = mock_client(
@@ -250,7 +335,11 @@ class StructuredTaskTests(unittest.TestCase):
             model="local-model",
             reasoning_effort="auto",
         )
-        client = mock_client('{"score":75,"feedback":"基本准确。"}')
+        client = mock_client(
+            '{"score":75,"feedback":"基本准确。",'
+            '"target_error_weight":0,"attribution_confidence":0,'
+            '"non_target_error_tags":[]}'
+        )
         LLMService(settings, client=client).evaluate_translation("a", "甲", "甲")
         kwargs = client.chat.completions.create.call_args.kwargs
         self.assertNotIn("reasoning_effort", kwargs)

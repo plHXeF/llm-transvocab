@@ -24,6 +24,8 @@ MIN_STABILITY_DAYS = 0.25
 MAX_STABILITY_DAYS = 365.0
 MASTERY_HISTORY_WEIGHT = 0.70
 MASTERY_SCORE_WEIGHT = 0.30
+DEFAULT_DIFFICULTY = 0.50
+MIN_DIFFICULTY_SAMPLES = 3
 
 _WHITESPACE_RE = re.compile(r"\s+")
 
@@ -133,6 +135,8 @@ class Progress:
     last_reviewed_at: datetime | None = None
     last_score: float | None = None
     updated_at: datetime | None = None
+    difficulty: float = DEFAULT_DIFFICULTY
+    difficulty_samples: int = 0
 
     @classmethod
     def sanitized(
@@ -145,6 +149,8 @@ class Progress:
         last_reviewed_at: Any = None,
         last_score: Any = None,
         updated_at: Any = None,
+        difficulty: Any = DEFAULT_DIFFICULTY,
+        difficulty_samples: Any = 0,
     ) -> "Progress":
         """Create safe domain state from possibly damaged SQLite values."""
 
@@ -168,6 +174,11 @@ class Progress:
             last_reviewed_at=parse_utc(last_reviewed_at),
             last_score=safe_score,
             updated_at=parse_utc(updated_at),
+            difficulty=min(
+                1.0,
+                max(0.0, _finite_float(difficulty, DEFAULT_DIFFICULTY)),
+            ),
+            difficulty_samples=_nonnegative_int(difficulty_samples),
         )
 
 
@@ -192,6 +203,15 @@ class ReviewEvent:
     user_translation: str | None = None
     feedback: str | None = None
     review_key: str | None = None
+    target_error_weight: float | None = None
+    attribution_confidence: float | None = None
+    non_target_error_tags: tuple[str, ...] = ()
+    target_performance: float | None = None
+    expected_performance: float | None = None
+    effective_mastery_before: float | None = None
+    attempts_before: int = 0
+    evaluator_profile: str | None = None
+    meaning_revealed: bool = False
 
     @property
     def skipped(self) -> bool:
@@ -236,6 +256,8 @@ def evolve_progress(
         last_reviewed_at=old.last_reviewed_at,
         last_score=old.last_score,
         updated_at=old.updated_at,
+        difficulty=old.difficulty,
+        difficulty_samples=old.difficulty_samples,
     )
 
     if old.attempts == 0:
@@ -275,4 +297,6 @@ def evolve_progress(
         last_reviewed_at=timestamp,
         last_score=safe_score,
         updated_at=timestamp,
+        difficulty=old.difficulty,
+        difficulty_samples=old.difficulty_samples,
     )

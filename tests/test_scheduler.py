@@ -24,6 +24,8 @@ def reviewed_progress(
     mastery: float = 0.8,
     stability_days: float = 2.0,
     elapsed_days: float = 0.0,
+    difficulty: float = 0.5,
+    difficulty_samples: int = 0,
 ) -> Progress:
     reviewed_at = NOW - timedelta(days=elapsed_days)
     return Progress(
@@ -34,6 +36,8 @@ def reviewed_progress(
         last_reviewed_at=reviewed_at,
         last_score=mastery * 100,
         updated_at=reviewed_at,
+        difficulty=difficulty,
+        difficulty_samples=difficulty_samples,
     )
 
 
@@ -97,6 +101,30 @@ class SchedulerTests(unittest.TestCase):
         self.assertGreater(priority_for(low_mastery, now=NOW), priority_for(high_mastery, now=NOW))
         self.assertGreater(priority_for(forgotten, now=NOW), priority_for(high_mastery, now=NOW))
         self.assertEqual(priority_for(None, now=NOW), 1.0)
+
+    def test_difficulty_bonus_requires_three_samples_and_is_capped(self) -> None:
+        card = Card("word", "n", "meaning")
+        ordinary = reviewed_progress(card, mastery=0.8)
+        observing = reviewed_progress(
+            card,
+            mastery=0.8,
+            difficulty=1.0,
+            difficulty_samples=2,
+        )
+        hard = reviewed_progress(
+            card,
+            mastery=0.8,
+            difficulty=1.0,
+            difficulty_samples=3,
+        )
+        self.assertEqual(
+            priority_for(observing, now=NOW),
+            priority_for(ordinary, now=NOW),
+        )
+        self.assertAlmostEqual(
+            priority_for(hard, now=NOW) - priority_for(ordinary, now=NOW),
+            0.15,
+        )
 
     def test_rank_is_deterministic_and_uses_source_order_for_ties(self) -> None:
         cards = [

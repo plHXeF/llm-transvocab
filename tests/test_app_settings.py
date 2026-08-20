@@ -6,7 +6,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app_settings import AppSettings, SettingsError, SettingsStore
-from llm_service import LLMSettings, ReasoningEffort
+from llm_service import LLMSettings, ReasoningEffort, SentenceDifficulty
 
 
 class SettingsStoreTests(unittest.TestCase):
@@ -24,7 +24,8 @@ class SettingsStoreTests(unittest.TestCase):
                 model="model-a",
                 api_key=self.secret,
                 reasoning_effort="medium",
-            )
+            ),
+            sentence_difficulty=SentenceDifficulty.IELTS,
         )
         self.patchers = [
             patch("app_settings.config.API_KEY", ""),
@@ -47,11 +48,13 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.llm.model, "model-a")
         self.assertEqual(loaded.llm.reasoning_effort, ReasoningEffort.MEDIUM)
         self.assertEqual(loaded.llm.api_key, self.secret)
+        self.assertEqual(loaded.sentence_difficulty, SentenceDifficulty.IELTS)
         self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.keys_path.stat().st_mode & 0o777, 0o600)
         self.assertNotIn(self.secret, self.path.read_text(encoding="utf-8"))
         payload = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["version"], 2)
+        self.assertEqual(payload["version"], 3)
+        self.assertEqual(payload["sentence_difficulty"], "ielts")
         self.assertNotIn("provider", payload["llm"])
 
     def test_missing_settings_returns_none(self):
@@ -170,8 +173,30 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.llm.api_key, "legacy-key")
         self.store.save(loaded, key_action="keep")
         migrated = json.loads(self.path.read_text(encoding="utf-8"))
-        self.assertEqual(migrated["version"], 2)
+        self.assertEqual(migrated["version"], 3)
+        self.assertEqual(
+            loaded.sentence_difficulty, SentenceDifficulty.CET6_POSTGRAD
+        )
         self.assertNotIn("provider", migrated["llm"])
+
+    def test_v2_settings_default_to_cet6_postgrad(self):
+        self.path.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "llm": {
+                        "model": "previous-model",
+                        "base_url": self.endpoint,
+                        "reasoning_effort": "disabled",
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        loaded = self.store.load()
+        self.assertEqual(
+            loaded.sentence_difficulty, SentenceDifficulty.CET6_POSTGRAD
+        )
 
     def test_legacy_custom_endpoint_slot_is_still_read(self):
         import hashlib

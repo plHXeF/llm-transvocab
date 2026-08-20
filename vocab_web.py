@@ -8,8 +8,13 @@ starts an LLM request.
 
 from __future__ import annotations
 
+import hashlib
+import math
 import re
+import threading
+import time
 import uuid
+from dataclasses import replace
 from datetime import datetime
 from typing import Any, Iterable, Sequence
 
@@ -31,8 +36,10 @@ from llm_service import (
     PROMPT_VERSIONS,
     ReasoningEffort,
     SENTENCE_PROMPT_VERSION,
+    SentenceDifficulty,
     SentenceResult,
     EvaluationResult,
+    coerce_sentence_difficulty,
     redact_text,
 )
 from model_error_log import ModelErrorLog
@@ -56,16 +63,44 @@ EFFORT_LABELS = {
     ReasoningEffort.HIGH: "高",
     ReasoningEffort.MAX: "最大",
 }
-REGISTER_STYLES = (
-    "natural daily conversation",
-    "clear academic prose",
-    "practical business communication",
-    "formal news analysis",
-    "descriptive general prose",
-)
+DIFFICULTY_LABELS = {
+    SentenceDifficulty.JUNIOR_HIGH: "初中",
+    SentenceDifficulty.GAOKAO_CET4: "高考/CET4",
+    SentenceDifficulty.CET6_POSTGRAD: "CET6/考研",
+    SentenceDifficulty.IELTS: "IELTS",
+}
+REGISTER_STYLES = {
+    SentenceDifficulty.JUNIOR_HIGH: (
+        "daily home life",
+        "school life",
+        "hobbies and friends",
+        "shopping or travel",
+    ),
+    SentenceDifficulty.GAOKAO_CET4: (
+        "campus life",
+        "practical communication",
+        "social and cultural topics",
+        "work and travel",
+    ),
+    SentenceDifficulty.CET6_POSTGRAD: (
+        "clear academic prose",
+        "formal news analysis",
+        "social or public issues",
+        "science and technology",
+        "descriptive general prose",
+    ),
+    SentenceDifficulty.IELTS: (
+        "education",
+        "environment and cities",
+        "science and technology",
+        "society and work",
+        "international daily life",
+    ),
+}
 MAX_IMPORT_BYTES = 2 * 1024 * 1024
 MAX_IMPORT_LINES = 5_000
 AI_IMPORT_CHUNK_LINES = 50
+MEANING_REVEAL_SECONDS = 5
 
 
 def _effort_options() -> tuple[ReasoningEffort, ...]:
@@ -80,23 +115,68 @@ def _effort_options() -> tuple[ReasoningEffort, ...]:
     )
 
 
-def _register_for(card: Card, attempts: int) -> str:
+def _register_for(
+    card: Card,
+    attempts: int,
+    difficulty: SentenceDifficulty | str,
+) -> str:
+    level = coerce_sentence_difficulty(difficulty)
+    styles = REGISTER_STYLES[level]
     digest = card.card_id.rsplit(":", 1)[-1]
     try:
         offset = int(digest[:8], 16)
     except ValueError:
         offset = 0
-    return REGISTER_STYLES[(offset + max(0, attempts)) % len(REGISTER_STYLES)]
+    return styles[(offset + max(0, attempts)) % len(styles)]
 
 
 def _generate_sentence_worker(
     settings: LLMSettings,
     card: Card,
     register: str,
+    difficulty: SentenceDifficulty | str,
 ) -> SentenceResult:
     """Background worker: deliberately contains no Streamlit access."""
 
-    return LLMService(settings).generate_sentence(card, register=register)
+    return LLMService(settings).generate_sentence(
+        card,
+        register=register,
+        difficulty=difficulty,
+    )
+
+
+def _difficulty_recalibration_worker(db_path: str) -> None:
+    """Background worker: recalibration is local and never touches Streamlit."""
+
+    try:
+        LearningStore(db_path).recalibrate_difficulty()
+    except Exception:
+        # Difficulty is only a bounded scheduling bonus. A failed refresh must
+        # never interrupt learning; the next eligible answer will try again.
+        return
+
+
+def _schedule_difficulty_recalibration(store: LearningStore) -> None:
+    if not store.difficulty_recalibration_due():
+        return
+    threading.Thread(
+        target=_difficulty_recalibration_worker,
+        args=(str(store.db_path),),
+        name="vocab-difficulty-recalibration",
+        daemon=True,
+    ).start()
+
+
+def _evaluator_profile(settings: LLMSettings, prompt_version: str) -> str:
+    material = "\x00".join(
+        (
+            settings.resolved_base_url or "",
+            settings.model,
+            settings.reasoning_effort.value,
+            prompt_version,
+        )
+    )
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 def _safe_ui_error(error: object, settings: LLMSettings | None = None) -> str:
@@ -160,8 +240,13 @@ def _initialize_session_state(initial_settings: AppSettings) -> None:
         "current_generation_error": None,
         "evaluation_result": None,
         "evaluation_error": None,
+        "meaning_revealed": False,
+        "meaning_visible": False,
+        "meaning_reveal_deadline": None,
         "batch_results": [],
         "batch_size": 20,
+        "sentence_difficulty": initial_settings.sentence_difficulty.value,
+        "applied_sentence_difficulty": initial_settings.sentence_difficulty.value,
         "import_rows": [],
         "import_rejected": [],
         "import_issues": [],
@@ -171,6 +256,7 @@ def _initialize_session_state(initial_settings: AppSettings) -> None:
         "data_flash": None,
         "model_log_flash": None,
         "model_log_warning": None,
+        "settings_warning": None,
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -196,6 +282,9 @@ def _clear_batch_state(*, completed: bool = False) -> None:
     st.session_state.current_generation_error = None
     st.session_state.evaluation_result = None
     st.session_state.evaluation_error = None
+    st.session_state.meaning_revealed = False
+    st.session_state.meaning_visible = False
+    st.session_state.meaning_reveal_deadline = None
     if not completed:
         st.session_state.batch_cards = []
         st.session_state.batch_id = ""
@@ -241,6 +330,9 @@ def _start_batch(
     st.session_state.current_generation_error = None
     st.session_state.evaluation_result = None
     st.session_state.evaluation_error = None
+    st.session_state.meaning_revealed = False
+    st.session_state.meaning_visible = False
+    st.session_state.meaning_reveal_deadline = None
     st.session_state.batch_results = []
     st.session_state.batch_complete = False
     st.session_state.learning_active = bool(scheduled)
@@ -253,6 +345,9 @@ def _advance_card() -> None:
     st.session_state.current_generation_error = None
     st.session_state.evaluation_result = None
     st.session_state.evaluation_error = None
+    st.session_state.meaning_revealed = False
+    st.session_state.meaning_visible = False
+    st.session_state.meaning_reveal_deadline = None
     if st.session_state.current_index >= len(st.session_state.batch_cards):
         _clear_batch_state(completed=True)
 
@@ -271,7 +366,12 @@ def _prepare_current_card(store: LearningStore) -> None:
 
     card = cards[index]
     progress = store.get_progress(card.card_id)
-    register = _register_for(card, 0 if progress is None else progress.attempts)
+    difficulty = coerce_sentence_difficulty(st.session_state.sentence_difficulty)
+    register = _register_for(
+        card,
+        0 if progress is None else progress.attempts,
+        difficulty,
+    )
     key = _prefetch_key(card)
     manager: PrefetchManager = st.session_state.prefetch_manager
     used_prefetch = manager.matches(key)
@@ -284,6 +384,7 @@ def _prepare_current_card(store: LearningStore) -> None:
                     st.session_state.llm_settings,
                     card,
                     register,
+                    difficulty,
                 )
         st.session_state.current_word_data = sentence
         st.session_state.current_generation_error = None
@@ -312,7 +413,12 @@ def _schedule_next_prefetch(store: LearningStore) -> None:
         return
     next_card = cards[next_index]
     progress = store.get_progress(next_card.card_id)
-    register = _register_for(next_card, 0 if progress is None else progress.attempts)
+    difficulty = coerce_sentence_difficulty(st.session_state.sentence_difficulty)
+    register = _register_for(
+        next_card,
+        0 if progress is None else progress.attempts,
+        difficulty,
+    )
     key = _prefetch_key(next_card)
     manager: PrefetchManager = st.session_state.prefetch_manager
     if not manager.matches(key):
@@ -322,6 +428,7 @@ def _schedule_next_prefetch(store: LearningStore) -> None:
             st.session_state.llm_settings,
             next_card,
             register,
+            difficulty,
         )
 
 
@@ -397,7 +504,7 @@ def _render_model_settings(settings_store: SettingsStore) -> None:
             "environment": "使用环境变量 Key",
             "none": "未配置 Key",
         }
-        st.caption(f"凭据状态：{source_labels[key_source]}（不会回填到浏览器）")
+        st.caption(f"凭据状态：{source_labels[key_source]}")
 
         key_action = st.radio(
             "API Key 操作",
@@ -538,7 +645,13 @@ def _render_model_settings(settings_store: SettingsStore) -> None:
                     reasoning_effort=effort_value,
                 )
                 draft.validate_for_request()
-                settings_store.save(AppSettings(llm=draft), key_action=key_action)
+                settings_store.save(
+                    AppSettings(
+                        llm=draft,
+                        sentence_difficulty=st.session_state.sentence_difficulty,
+                    ),
+                    key_action=key_action,
+                )
                 effective_key = settings_store.load_api_key(draft.resolved_base_url)
                 effective = LLMSettings(
                     base_url=draft.base_url,
@@ -564,6 +677,35 @@ def _render_model_settings(settings_store: SettingsStore) -> None:
         )
 
 
+def _sentence_difficulty_changed(settings_store: SettingsStore) -> None:
+    previous = coerce_sentence_difficulty(
+        st.session_state.applied_sentence_difficulty
+    )
+    try:
+        selected = coerce_sentence_difficulty(
+            st.session_state.sentence_difficulty
+        )
+        settings_store.save(
+            AppSettings(
+                llm=st.session_state.llm_settings,
+                sentence_difficulty=selected,
+            ),
+            key_action="keep",
+        )
+    except (SettingsError, LLMConfigurationError, ValueError) as error:
+        st.session_state.sentence_difficulty = previous.value
+        st.session_state.settings_warning = _safe_ui_error(
+            error, st.session_state.llm_settings
+        )
+        return
+    st.session_state.applied_sentence_difficulty = selected.value
+    st.session_state.config_revision += 1
+    st.session_state.settings_flash = (
+        f"出题难度已切换为 {DIFFICULTY_LABELS[selected]}。"
+    )
+    _invalidate_model_work()
+
+
 def _render_reset_controls(store: LearningStore) -> None:
     with st.expander("数据清理", expanded=False):
         if st.session_state.pop("clear_confirm_data_reset", False):
@@ -579,7 +721,10 @@ def _render_reset_controls(store: LearningStore) -> None:
         ):
             count = store.reset_progress()
             _clear_batch_state()
-            st.session_state.data_flash = f"已重置 {count} 个词条的调度状态，历史仍保留。"
+            st.session_state.data_flash = (
+                f"已重置 {count} 个词条的熟练度、遗忘和个人难度状态，"
+                "历史仍保留。"
+            )
             st.session_state.clear_confirm_data_reset = True
             st.rerun()
         if st.button(
@@ -608,6 +753,42 @@ def _render_reset_controls(store: LearningStore) -> None:
         st.caption("以上操作都不会修改 vocabularies.csv 或模型设置。")
 
 
+def _model_error_dataframe(entries: Sequence[Any]) -> pd.DataFrame:
+    category_labels = {
+        "authentication": "认证失败",
+        "rate_limit": "请求限流",
+        "timeout": "请求超时",
+        "connection": "连接失败",
+        "api_status": "API 状态错误",
+        "response_validation": "返回格式无效",
+        "configuration": "配置错误",
+        "model_service": "模型服务错误",
+        "unknown": "未知错误",
+    }
+
+    def optional(value: Any) -> str:
+        return "—" if value is None or value == "" else str(value)
+
+    rows = []
+    for entry in reversed(entries[-20:]):
+        rows.append(
+            {
+                "时间(UTC)": entry.timestamp.replace("T", " ")[:19],
+                "环节": entry.operation,
+                "类别": category_labels.get(entry.category, entry.category),
+                "状态": optional(entry.status_code),
+                "结束原因": optional(entry.finish_reason),
+                "输出 token": optional(entry.completion_tokens),
+                "思考 token": optional(entry.reasoning_tokens),
+                "尝试": optional(entry.attempts),
+                "耗时(ms)": optional(entry.latency_ms),
+                "模型": optional(entry.model),
+                "错误": entry.message,
+            }
+        )
+    return pd.DataFrame(rows, dtype="string")
+
+
 def _render_model_diagnostics(error_log: ModelErrorLog) -> None:
     with st.expander("模型错误诊断", expanded=False):
         if st.session_state.model_log_flash:
@@ -618,59 +799,17 @@ def _render_model_diagnostics(error_log: ModelErrorLog) -> None:
             st.session_state.model_log_warning = None
 
         entries = error_log.list_entries()
-        st.caption(
-            "只记录时间、调用环节、错误类别、结束原因、token 用量、耗时、"
-            "尝试次数、状态码、请求 ID 和模型配置摘要；"
-            "不记录 API Key、提示词、例句或用户译文。"
-        )
+        st.caption("日志已脱敏，不含 API Key、提示词或作答内容。")
         if not entries:
             st.info("暂无模型错误日志。")
             return
 
         st.metric("已保留错误", len(entries))
-        category_labels = {
-            "authentication": "认证失败",
-            "rate_limit": "请求限流",
-            "timeout": "请求超时",
-            "connection": "连接失败",
-            "api_status": "API 状态错误",
-            "response_validation": "返回格式无效",
-            "configuration": "配置错误",
-            "model_service": "模型服务错误",
-            "unknown": "未知错误",
-        }
-        recent_rows = []
-        for entry in reversed(entries[-20:]):
-            recent_rows.append(
-                {
-                    "时间(UTC)": entry.timestamp.replace("T", " ")[:19],
-                    "环节": entry.operation,
-                    "类别": category_labels.get(entry.category, entry.category),
-                    "状态": entry.status_code if entry.status_code is not None else "—",
-                    "结束原因": entry.finish_reason or "—",
-                    "输出 token": (
-                        entry.completion_tokens
-                        if entry.completion_tokens is not None
-                        else "—"
-                    ),
-                    "思考 token": (
-                        entry.reasoning_tokens
-                        if entry.reasoning_tokens is not None
-                        else "—"
-                    ),
-                    "尝试": entry.attempts if entry.attempts is not None else "—",
-                    "耗时(ms)": (
-                        entry.latency_ms if entry.latency_ms is not None else "—"
-                    ),
-                    "模型": entry.model or "—",
-                    "错误": entry.message,
-                }
-            )
         st.dataframe(
-            pd.DataFrame(recent_rows),
+            _model_error_dataframe(entries),
             hide_index=True,
             width="stretch",
-            height=min(420, 78 + 35 * len(recent_rows)),
+            height=min(420, 78 + 35 * min(20, len(entries))),
         )
         st.download_button(
             "下载脱敏日志",
@@ -703,9 +842,19 @@ def _render_sidebar(
     error_log: ModelErrorLog,
 ) -> str:
     with st.sidebar:
-        st.markdown("## 📚 学习控制台")
+        st.markdown("## 学习控制台")
         _render_model_settings(settings_store)
 
+        st.selectbox(
+            "出题难度",
+            [item.value for item in SentenceDifficulty],
+            format_func=lambda value: DIFFICULTY_LABELS[
+                SentenceDifficulty(value)
+            ],
+            key="sentence_difficulty",
+            on_change=_sentence_difficulty_changed,
+            args=(settings_store,),
+        )
         st.number_input(
             "每批词数",
             min_value=5,
@@ -719,7 +868,6 @@ def _render_sidebar(
         st.markdown("---")
         _render_model_diagnostics(error_log)
         _render_reset_controls(learning_store)
-        st.caption("Key 按 Base URL 隔离保存在本机文件中（0600）。")
     return page
 
 
@@ -740,7 +888,6 @@ def _render_batch_summary() -> None:
             "—" if not scores else f"{sum(scores) / len(scores):.1f}",
         )
         col3.metric("跳过", skipped)
-        st.balloons()
     else:
         st.info("本轮没有产生学习记录。")
     if st.button("返回并准备新一轮", type="primary"):
@@ -755,14 +902,13 @@ def _render_recent_batch_results() -> None:
     st.markdown("---")
     st.subheader("本轮最近记录")
     for item in reversed(results[-5:]):
-        color = "🟢" if item["score"] >= 80 else "🟡" if item["score"] >= 60 else "🔴"
         result_label = (
             "已跳过"
             if item["status"] == "skipped"
             else f"{item['score']:.0f} 分"
         )
         with st.expander(
-            f"{color} {item['word']} · {item['pos']} · {result_label}"
+            f"{item['word']} · {item['pos']} · {result_label}"
         ):
             if item.get("sentence"):
                 st.write(item["sentence"])
@@ -809,6 +955,54 @@ def _record_skip(store: LearningStore, card: Card) -> bool:
     return True
 
 
+@st.fragment(run_every=1)
+def _render_meaning_countdown(card: Card, index: int) -> None:
+    deadline = st.session_state.meaning_reveal_deadline
+    remaining = 0 if deadline is None else math.ceil(deadline - time.monotonic())
+    if remaining <= 0:
+        st.session_state.meaning_visible = False
+        st.session_state.meaning_reveal_deadline = None
+        st.rerun()
+        return
+
+    st.info(card.meaning)
+    st.caption(f"剩余 {remaining} 秒")
+    if st.button(
+        "收起释义",
+        key=f"hide_meaning_{st.session_state.batch_id}_{index}",
+        width="stretch",
+    ):
+        st.session_state.meaning_visible = False
+        st.session_state.meaning_reveal_deadline = None
+        st.rerun()
+
+
+def _render_one_time_meaning(card: Card, index: int) -> None:
+    if not st.session_state.meaning_revealed:
+        if st.button(
+            "查看释义",
+            key=f"reveal_meaning_{st.session_state.batch_id}_{index}",
+            width="stretch",
+        ):
+            st.session_state.meaning_revealed = True
+            st.session_state.meaning_visible = True
+            st.session_state.meaning_reveal_deadline = (
+                time.monotonic() + MEANING_REVEAL_SECONDS
+            )
+            st.rerun()
+        return
+
+    if st.session_state.meaning_visible:
+        _render_meaning_countdown(card, index)
+    else:
+        st.button(
+            "释义已查看",
+            key=f"meaning_locked_{st.session_state.batch_id}_{index}",
+            disabled=True,
+            width="stretch",
+        )
+
+
 def _render_learning_page(
     vocabulary: VocabularyLoadResult,
     store: LearningStore,
@@ -834,9 +1028,7 @@ def _render_learning_page(
         col2.metric("已学词条", reviewed)
         col3.metric("未学词条", max(0, len(vocabulary.cards) - reviewed))
         st.info(
-            "本轮将按熟练度和遗忘时间排序；已有足够复习词时，"
-            "至少 25% 的题目用于复习并均匀穿插。"
-            "全新词库同权重时按 CSV 顺序出题。"
+            "系统会优先安排需要复习和个人学习中较难的词条。"
         )
         if st.button("开始本轮", type="primary"):
             try:
@@ -890,12 +1082,11 @@ def _render_learning_page(
     with main_col:
         st.subheader(card.word)
         st.caption(f"词性：{card.pos}")
-        with st.expander("查看释义"):
-            st.write(card.meaning)
         st.markdown("**英文例句**")
         st.info(sentence_result.english_sentence)
 
         if st.session_state.evaluation_result is None:
+            _render_one_time_meaning(card, index)
             with st.form(f"translation_form_{st.session_state.batch_id}_{index}"):
                 user_translation = st.text_area(
                     "请输入中文翻译",
@@ -926,6 +1117,16 @@ def _render_learning_page(
                                 sentence_result.english_sentence,
                                 sentence_result.chinese_translation,
                                 user_translation,
+                                card=card,
+                            )
+                        meaning_revealed = bool(
+                            st.session_state.meaning_revealed
+                        )
+                        if meaning_revealed:
+                            evaluation = replace(
+                                evaluation,
+                                target_error_weight=1.0,
+                                attribution_confidence=1.0,
                             )
                         store.record_review(
                             card,
@@ -935,11 +1136,20 @@ def _render_learning_page(
                             reference_translation=sentence_result.chinese_translation,
                             user_translation=user_translation,
                             feedback=evaluation.feedback,
+                            target_error_weight=evaluation.target_error_weight,
+                            attribution_confidence=evaluation.attribution_confidence,
+                            non_target_error_tags=evaluation.non_target_error_tags,
+                            evaluator_profile=_evaluator_profile(
+                                st.session_state.llm_settings,
+                                evaluation.prompt_version,
+                            ),
+                            meaning_revealed=meaning_revealed,
                             review_key=(
                                 f"{st.session_state.batch_id}:"
                                 f"{index}:{card.card_id}"
                             ),
                         )
+                        _schedule_difficulty_recalibration(store)
                         st.session_state.evaluation_result = evaluation
                         st.session_state.evaluation_error = None
                         st.session_state.batch_results.append(
@@ -954,6 +1164,9 @@ def _render_learning_page(
                                 "reference_translation": sentence_result.chinese_translation,
                                 "user_translation": user_translation,
                                 "feedback": evaluation.feedback,
+                                "target_error_weight": evaluation.target_error_weight,
+                                "attribution_confidence": evaluation.attribution_confidence,
+                                "meaning_revealed": meaning_revealed,
                             }
                         )
                         st.rerun()
@@ -988,6 +1201,15 @@ def _render_learning_page(
             )
             st.caption("分数（0–100）")
             st.info(evaluation.feedback)
+            if (
+                not st.session_state.meaning_revealed
+                and evaluation.attribution_confidence > 0
+            ):
+                st.caption(
+                    "本次扣分归因于目标词："
+                    f"{evaluation.target_error_weight:.0%}"
+                    f"（归因置信度 {evaluation.attribution_confidence:.0%}）"
+                )
             st.markdown("**参考翻译**")
             st.write(sentence_result.chinese_translation)
             if st.button("下一个单词", type="primary", width="stretch"):
@@ -1007,6 +1229,12 @@ def _event_dataframe(events: Sequence[ReviewEvent]) -> pd.DataFrame:
                 "释义": event.meaning,
                 "分数": event.score,
                 "状态": "跳过" if event.skipped else "已评分",
+                "目标词错误归因": (
+                    None
+                    if event.target_error_weight is None
+                    else round(event.target_error_weight * 100, 1)
+                ),
+                "查看释义": "是" if event.meaning_revealed else "否",
                 "反馈": event.feedback or "",
             }
             for event in events
@@ -1090,6 +1318,21 @@ def _render_statistics_page(
 
     st.markdown("---")
     st.subheader("当前掌握与复习优先级")
+    difficulty_status = store.difficulty_status()
+    if difficulty_status["trained"]:
+        st.caption(
+            "个人难度模型已校准："
+            f"{difficulty_status['valid_samples']} 个有效归因样本，"
+            f"个人目标词表现基线 {difficulty_status['baseline']:.1%}；"
+            f"累计到 {difficulty_status['next_training_at']} 个样本时后台更新。"
+        )
+    else:
+        st.caption(
+            "个人难度模型正在收集样本："
+            f"{difficulty_status['valid_samples']}/"
+            f"{difficulty_status['next_training_at']}；"
+            "单个词条至少需要 3 个可信归因样本。"
+        )
     if not progress:
         st.info("暂无当前熟练度；重置权重后历史仍会保留，但这里会清空。")
         return
@@ -1107,6 +1350,11 @@ def _render_statistics_page(
                 "释义": card.meaning,
                 "熟练度": round(item.mastery * 100, 1),
                 "预计保留率": round(retention_for(item) * 100, 1),
+                "个人难度": (
+                    f"观察中 {item.difficulty_samples}/3"
+                    if item.difficulty_samples < 3
+                    else f"{item.difficulty * 100:.1f}"
+                ),
                 "复习优先级": round(priority_for(item) * 100, 1),
                 "练习次数": item.attempts,
                 "上次复习": _format_local_time(item.last_reviewed_at),
@@ -1508,6 +1756,9 @@ def main() -> None:
     if st.session_state.settings_flash:
         st.success(st.session_state.settings_flash)
         st.session_state.settings_flash = None
+    if st.session_state.settings_warning:
+        st.warning(st.session_state.settings_warning)
+        st.session_state.settings_warning = None
 
     page = _render_sidebar(settings_store, learning_store, error_log)
     if st.session_state.data_flash:
@@ -1519,13 +1770,6 @@ def main() -> None:
         _render_statistics_page(vocabulary, learning_store)
     else:
         _render_vocabulary_page(repository, vocabulary)
-
-    st.caption(
-        "提示词版本："
-        + " · ".join(f"{name}={version}" for name, version in PROMPT_VERSIONS.items())
-        + f" · evaluation={EVALUATION_PROMPT_VERSION}"
-    )
-
 
 if __name__ == "__main__":
     main()

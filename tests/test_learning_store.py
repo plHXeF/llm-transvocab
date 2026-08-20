@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import sqlite3
 import tempfile
@@ -37,11 +38,17 @@ class LearningStoreTests(unittest.TestCase):
             reference_translation="他们呼吁保持冷静。",
             user_translation="他们发出保持冷静的呼吁。",
             feedback="准确。",
+            target_error_weight=0.1,
+            attribution_confidence=0.9,
+            non_target_error_tags=("chinese_expression",),
+            evaluator_profile="grader-v1",
         )
 
         self.assertEqual(progress.attempts, 1)
         self.assertAlmostEqual(progress.mastery, 0.85)
         self.assertAlmostEqual(progress.stability_days, 3.0)
+        self.assertEqual(progress.difficulty, 0.5)
+        self.assertEqual(progress.difficulty_samples, 1)
         self.assertEqual(progress.last_reviewed_at, self.reviewed_at)
 
         reopened = LearningStore(self.db_path)
@@ -64,6 +71,122 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual(event.reviewed_at, self.reviewed_at)
         self.assertAlmostEqual(event.mastery_before, 0.0)
         self.assertAlmostEqual(event.mastery_after, 0.85)
+        self.assertEqual(event.target_error_weight, 0.1)
+        self.assertEqual(event.attribution_confidence, 0.9)
+        self.assertEqual(event.non_target_error_tags, ("chinese_expression",))
+        self.assertAlmostEqual(event.target_performance, 0.985)
+        self.assertIsNotNone(event.expected_performance)
+        self.assertEqual(event.attempts_before, 0)
+        self.assertEqual(event.evaluator_profile, "grader-v1")
+        self.assertFalse(event.meaning_revealed)
+
+    def test_meaning_reveal_is_a_difficulty_signal_not_a_baseline_sample(self) -> None:
+        for index in range(3):
+            progress = self.store.record_review(
+                self.card,
+                100,
+                reviewed_at=self.reviewed_at + timedelta(days=index),
+                target_error_weight=1.0,
+                attribution_confidence=1.0,
+                meaning_revealed=True,
+            )
+        self.assertEqual(progress.difficulty_samples, 3)
+        self.assertGreater(progress.difficulty, 0.5)
+        self.assertEqual(self.store.difficulty_status()["valid_samples"], 0)
+        events = self.store.list_review_events()
+        self.assertTrue(all(event.meaning_revealed for event in events))
+        self.assertTrue(all(event.score == 100 for event in events))
+
+    def test_personal_difficulty_activates_after_three_attributed_answers(self) -> None:
+        hard = Card("recondite", "adj", "深奥难懂的")
+        context = Card("pellucid", "adj", "表达清晰的")
+        hard_progress = None
+        context_progress = None
+        for index in range(3):
+            reviewed_at = self.reviewed_at + timedelta(days=index)
+            hard_progress = self.store.record_review(
+                hard,
+                30,
+                reviewed_at=reviewed_at,
+                target_error_weight=1.0,
+                attribution_confidence=1.0,
+            )
+            context_progress = self.store.record_review(
+                context,
+                30,
+                reviewed_at=reviewed_at,
+                target_error_weight=0.0,
+                attribution_confidence=1.0,
+                non_target_error_tags=("context_vocabulary",),
+            )
+            if index < 2:
+                self.assertEqual(hard_progress.difficulty, 0.5)
+                self.assertEqual(context_progress.difficulty, 0.5)
+
+        self.assertEqual(hard_progress.difficulty_samples, 3)
+        self.assertEqual(context_progress.difficulty_samples, 3)
+        self.assertGreater(hard_progress.difficulty, 0.5)
+        self.assertLess(context_progress.difficulty, 0.5)
+        self.assertGreater(hard_progress.difficulty, context_progress.difficulty)
+
+    def test_personal_model_recalibrates_after_thirty_valid_answers(self) -> None:
+        for index in range(30):
+            self.store.record_review(
+                Card(f"word-{index}", "n", "meaning"),
+                70 + index % 20,
+                reviewed_at=self.reviewed_at + timedelta(minutes=index),
+                target_error_weight=0.5,
+                attribution_confidence=0.9,
+            )
+        self.assertTrue(self.store.difficulty_recalibration_due())
+        collecting = self.store.difficulty_status()
+        self.assertFalse(collecting["trained"])
+        self.assertEqual(collecting["valid_samples"], 30)
+        self.assertTrue(self.store.recalibrate_difficulty())
+        self.assertFalse(self.store.difficulty_recalibration_due())
+        model = json.loads(self.store.get_meta("difficulty_model"))
+        self.assertEqual(model["sample_count"], 30)
+        self.assertGreaterEqual(model["baseline"], 0.0)
+        self.assertLessEqual(model["baseline"], 1.0)
+        status = self.store.difficulty_status()
+        self.assertTrue(status["trained"])
+        self.assertEqual(status["next_training_at"], 50)
+        for index in range(19):
+            self.store.record_review(
+                Card(f"later-{index}", "n", "meaning"),
+                80,
+                target_error_weight=0.5,
+                attribution_confidence=0.9,
+            )
+        self.assertFalse(self.store.difficulty_recalibration_due())
+        self.store.record_review(
+            Card("later-19", "n", "meaning"),
+            80,
+            target_error_weight=0.5,
+            attribution_confidence=0.9,
+        )
+        self.assertTrue(self.store.difficulty_recalibration_due())
+
+    def test_reset_progress_starts_a_new_difficulty_epoch(self) -> None:
+        for index in range(3):
+            progress = self.store.record_review(
+                self.card,
+                20,
+                reviewed_at=self.reviewed_at + timedelta(days=index),
+                target_error_weight=1.0,
+                attribution_confidence=1.0,
+            )
+        self.assertGreater(progress.difficulty, 0.5)
+        self.store.reset_progress()
+        restarted = self.store.record_review(
+            self.card,
+            20,
+            reviewed_at=self.reviewed_at + timedelta(days=4),
+            target_error_weight=1.0,
+            attribution_confidence=1.0,
+        )
+        self.assertEqual(restarted.difficulty_samples, 1)
+        self.assertEqual(restarted.difficulty, 0.5)
 
     def test_first_stability_uses_score_bands(self) -> None:
         cases = ((59, 0.25), (60, 1.0), (79.99, 1.0), (80, 3.0), (89.99, 3.0), (90, 7.0))
@@ -249,6 +372,8 @@ class LearningStoreTests(unittest.TestCase):
         self.assertIsNone(progress.last_reviewed_at)
         self.assertEqual(progress.last_score, 100.0)
         self.assertIsNone(progress.updated_at)
+        self.assertEqual(progress.difficulty, 0.5)
+        self.assertEqual(progress.difficulty_samples, 0)
 
     def test_naive_and_non_utc_timestamps_are_saved_as_utc(self) -> None:
         naive = datetime(2026, 8, 15, 8, 30)
@@ -340,7 +465,7 @@ class LearningStoreTests(unittest.TestCase):
             )
 
         migrated = LearningStore(legacy_path)
-        self.assertEqual(migrated.schema_version(), 2)
+        self.assertEqual(migrated.schema_version(), SCHEMA_VERSION)
         self.assertEqual(migrated.get_progress(self.card.card_id).attempts, 1)
         events = migrated.list_review_events()
         self.assertEqual(len(events), 1)
@@ -355,6 +480,17 @@ class LearningStoreTests(unittest.TestCase):
             }
         self.assertIn("review_key", columns)
         self.assertIn("idx_review_events_review_key", indexes)
+        with sqlite3.connect(legacy_path) as connection:
+            progress_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(progress)")
+            }
+            event_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(review_events)")
+            }
+        self.assertIn("difficulty", progress_columns)
+        self.assertIn("target_error_weight", event_columns)
+        self.assertIn("meaning_revealed", event_columns)
 
         updated = migrated.record_review(
             self.card,

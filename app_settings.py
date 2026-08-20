@@ -14,13 +14,16 @@ import config
 from llm_service import (
     LLMConfigurationError,
     LLMSettings,
+    SentenceDifficulty,
+    coerce_sentence_difficulty,
     mask_api_key,
     redact_text,
 )
 
 
-SETTINGS_FORMAT_VERSION = 2
+SETTINGS_FORMAT_VERSION = 3
 LEGACY_SETTINGS_FORMAT_VERSION = 1
+PREVIOUS_SETTINGS_FORMAT_VERSION = 2
 KEYS_FORMAT_VERSION = 1
 KeyAction = Literal["replace", "keep", "delete"]
 ApiKeySource = Literal["local", "environment", "none"]
@@ -33,13 +36,22 @@ class SettingsError(RuntimeError):
 @dataclass(frozen=True)
 class AppSettings:
     llm: LLMSettings
+    sentence_difficulty: SentenceDifficulty | str = SentenceDifficulty.CET6_POSTGRAD
     version: int = SETTINGS_FORMAT_VERSION
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "sentence_difficulty",
+            coerce_sentence_difficulty(self.sentence_difficulty),
+        )
 
     def safe_dict(self) -> dict[str, Any]:
         """Return a log/UI-safe representation with a masked API key."""
 
         return {
             "version": self.version,
+            "sentence_difficulty": self.sentence_difficulty.value,
             "llm": {
                 "model": self.llm.model,
                 "api_key": mask_api_key(self.llm.api_key),
@@ -55,6 +67,7 @@ class AppSettings:
 
         return {
             "version": self.version,
+            "sentence_difficulty": self.sentence_difficulty.value,
             "llm": {
                 "model": self.llm.model,
                 "base_url": self.llm.base_url,
@@ -257,7 +270,11 @@ def _endpoint_from_storage(payload: object) -> str | None:
     if not isinstance(payload, Mapping):
         raise ValueError("设置文件顶层必须是 JSON 对象")
     version = payload.get("version")
-    if version not in {LEGACY_SETTINGS_FORMAT_VERSION, SETTINGS_FORMAT_VERSION}:
+    if version not in {
+        LEGACY_SETTINGS_FORMAT_VERSION,
+        PREVIOUS_SETTINGS_FORMAT_VERSION,
+        SETTINGS_FORMAT_VERSION,
+    }:
         raise ValueError("设置文件版本不受支持")
     llm_payload = payload.get("llm")
     if not isinstance(llm_payload, Mapping):
@@ -280,6 +297,9 @@ def _settings_from_storage(payload: object, *, api_key: str) -> AppSettings:
     assert isinstance(llm_payload, Mapping)
     return AppSettings(
         version=SETTINGS_FORMAT_VERSION,
+        sentence_difficulty=payload.get(
+            "sentence_difficulty", SentenceDifficulty.CET6_POSTGRAD.value
+        ),
         llm=LLMSettings(
             base_url=base_url,
             model=llm_payload.get("model", ""),

@@ -1,3 +1,4 @@
+import json
 import shutil
 import tempfile
 import unittest
@@ -6,6 +7,7 @@ from unittest.mock import patch
 
 import config
 import llm_service
+import pyarrow as pa
 from domain import Card
 from learning_store import LearningStore
 from llm_service import (
@@ -15,6 +17,8 @@ from llm_service import (
     VocabularyItem,
 )
 from streamlit.testing.v1 import AppTest
+from model_error_log import ModelErrorEntry
+from vocab_web import _model_error_dataframe
 from vocabulary_repository import VocabularyRepository
 
 
@@ -62,19 +66,93 @@ class StreamlitSmokeTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertIn("词库管理", [header.value for header in app.header])
 
-    def test_learning_flow_records_score_without_a_real_api(self):
+    def test_mixed_optional_model_diagnostics_are_arrow_safe(self):
+        entries = [
+            ModelErrorEntry(
+                timestamp="2026-08-20T00:00:00Z",
+                operation="sentence_generation",
+                category="response_validation",
+                error_type="ValueError",
+                message="invalid",
+                completion_tokens=None,
+                attempts=None,
+            ),
+            ModelErrorEntry(
+                timestamp="2026-08-20T00:00:01Z",
+                operation="translation_evaluation",
+                category="timeout",
+                error_type="TimeoutError",
+                message="timeout",
+                status_code=504,
+                completion_tokens=2000,
+                reasoning_tokens=1000,
+                latency_ms=4500,
+                attempts=2,
+            ),
+        ]
+        frame = _model_error_dataframe(entries)
+        table = pa.Table.from_pandas(frame)
+        self.assertEqual(table.num_rows, 2)
+        self.assertTrue(all(str(dtype) == "string" for dtype in frame.dtypes))
+        self.assertIn("—", frame["输出 token"].tolist())
+
+    def test_sentence_difficulty_is_saved_and_used_for_generation(self):
         class FakeLLMService:
+            difficulties = []
+
             def __init__(self, settings):
                 self.settings = settings
 
-            def generate_sentence(self, card, register="general"):
+            def generate_sentence(
+                self, card, register="general", difficulty="cet6_postgrad"
+            ):
+                self.difficulties.append(str(getattr(difficulty, "value", difficulty)))
                 return SentenceResult(
                     english_sentence=f"I will use {card.word} correctly today.",
                     chinese_translation=f"我今天会正确使用 {card.word}。",
                 )
 
-            def evaluate_translation(self, original, reference, answer):
-                return EvaluationResult(score=88, feedback="意思准确，表达自然。")
+        with patch.object(llm_service, "LLMService", FakeLLMService):
+            app = AppTest.from_file(str(PROJECT_ROOT / "vocab_web.py")).run(timeout=30)
+            app.selectbox(key="sentence_difficulty").set_value("ielts").run(
+                timeout=30
+            )
+            self.assertFalse(app.exception)
+            payload = json.loads(
+                Path(config.APP_SETTINGS_FILE).read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["sentence_difficulty"], "ielts")
+            self.assertEqual(app.session_state["config_revision"], 1)
+
+            next(button for button in app.button if button.label == "开始本轮").click()
+            app.run(timeout=30)
+
+        self.assertFalse(app.exception)
+        self.assertTrue(FakeLLMService.difficulties)
+        self.assertTrue(
+            all(value == "ielts" for value in FakeLLMService.difficulties)
+        )
+
+    def test_learning_flow_records_score_without_a_real_api(self):
+        class FakeLLMService:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def generate_sentence(
+                self, card, register="general", difficulty="cet6_postgrad"
+            ):
+                return SentenceResult(
+                    english_sentence=f"I will use {card.word} correctly today.",
+                    chinese_translation=f"我今天会正确使用 {card.word}。",
+                )
+
+            def evaluate_translation(self, original, reference, answer, *, card=None):
+                return EvaluationResult(
+                    score=88,
+                    feedback="意思准确，表达自然。",
+                    target_error_weight=0.1,
+                    attribution_confidence=0.9,
+                )
 
         with patch.object(llm_service, "LLMService", FakeLLMService):
             app = AppTest.from_file(str(PROJECT_ROOT / "vocab_web.py")).run(timeout=30)
@@ -87,6 +165,96 @@ class StreamlitSmokeTests(unittest.TestCase):
             app.run(timeout=30)
             self.assertFalse(app.exception)
             self.assertTrue(any("88" in markdown.value for markdown in app.markdown))
+
+    def test_meaning_can_be_revealed_once_and_forces_target_attribution(self):
+        class FakeLLMService:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def generate_sentence(
+                self, card, register="general", difficulty="cet6_postgrad"
+            ):
+                return SentenceResult(
+                    english_sentence=f"I will use {card.word} correctly today.",
+                    chinese_translation=f"我今天会正确使用 {card.word}。",
+                )
+
+            def evaluate_translation(self, original, reference, answer, *, card=None):
+                return EvaluationResult(
+                    score=70,
+                    feedback="上下文部分有误。",
+                    target_error_weight=0.0,
+                    attribution_confidence=0.9,
+                    non_target_error_tags=("context_vocabulary",),
+                )
+
+        with patch.object(llm_service, "LLMService", FakeLLMService):
+            app = AppTest.from_file(str(PROJECT_ROOT / "vocab_web.py")).run(timeout=30)
+            next(button for button in app.button if button.label == "开始本轮").click()
+            app.run(timeout=30)
+
+            next(button for button in app.button if button.label == "查看释义").click()
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(
+                any("剩余 5 秒" in caption.value for caption in app.caption)
+            )
+
+            next(
+                button for button in app.button if button.label == "收起释义"
+            ).click()
+            app.run(timeout=30)
+            locked = next(
+                button
+                for button in app.button
+                if button.label == "释义已查看"
+            )
+            self.assertTrue(locked.disabled)
+            self.assertFalse(
+                any(button.label == "查看释义" for button in app.button)
+            )
+
+            app.text_area[0].set_value("我会翻译这个句子。")
+            next(button for button in app.button if button.label == "提交翻译").click()
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            event = LearningStore(config.LEARNING_DB_FILE).list_review_events()[-1]
+            self.assertEqual(event.target_error_weight, 1.0)
+            self.assertEqual(event.attribution_confidence, 1.0)
+            self.assertTrue(event.meaning_revealed)
+            self.assertEqual(event.feedback, "上下文部分有误。")
+
+    def test_meaning_auto_closes_after_deadline_without_waiting(self):
+        class FakeLLMService:
+            def __init__(self, settings):
+                self.settings = settings
+
+            def generate_sentence(
+                self, card, register="general", difficulty="cet6_postgrad"
+            ):
+                return SentenceResult(
+                    english_sentence=f"I will use {card.word} correctly today.",
+                    chinese_translation=f"我今天会正确使用 {card.word}。",
+                )
+
+        with patch.object(llm_service, "LLMService", FakeLLMService):
+            app = AppTest.from_file(str(PROJECT_ROOT / "vocab_web.py")).run(
+                timeout=30
+            )
+            next(button for button in app.button if button.label == "开始本轮").click()
+            app.run(timeout=30)
+            next(button for button in app.button if button.label == "查看释义").click()
+            app.run(timeout=30)
+            app.session_state["meaning_reveal_deadline"] = 0.0
+            app.run(timeout=30)
+
+        self.assertFalse(app.exception)
+        locked = next(
+            button for button in app.button if button.label == "释义已查看"
+        )
+        self.assertTrue(locked.disabled)
+        self.assertTrue(app.session_state["meaning_revealed"])
+        self.assertFalse(app.session_state["meaning_visible"])
 
     def test_invalid_local_import_shows_diagnostics_without_preview_rows(self):
         app = AppTest.from_file(str(PROJECT_ROOT / "vocab_web.py")).run(timeout=30)
@@ -339,7 +507,9 @@ class StreamlitSmokeTests(unittest.TestCase):
             def __init__(self, settings):
                 self.settings = settings
 
-            def generate_sentence(self, card, register="general"):
+            def generate_sentence(
+                self, card, register="general", difficulty="cet6_postgrad"
+            ):
                 raise llm_service.LLMServiceError(
                     f"upstream rejected {secret}",
                     category="api_status",
