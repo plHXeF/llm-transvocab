@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import closing
 from datetime import datetime, timezone
+import json
 import math
 import os
 from pathlib import Path
@@ -13,10 +14,13 @@ from typing import Any, Callable, Iterable, TypeVar
 import warnings
 
 from domain import (
+    DEFAULT_DIFFICULTY,
     DEFAULT_STABILITY_DAYS,
+    MIN_DIFFICULTY_SAMPLES,
     Card,
     Progress,
     ReviewEvent,
+    ensure_utc,
     evolve_progress,
     format_utc,
     parse_utc,
@@ -24,9 +28,15 @@ from domain import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 DEFAULT_DB_PATH = Path(__file__).resolve().parent / "data" / "learning.db"
 VALID_REVIEW_STATUSES = frozenset({"answered", "skipped"})
+DIFFICULTY_MODEL_VERSION = "personal-difficulty.v1"
+DIFFICULTY_MIN_GLOBAL_SAMPLES = 30
+DIFFICULTY_RETRAIN_INTERVAL = 20
+DIFFICULTY_MAX_TRAINING_EVENTS = 1_000
+MIN_ATTRIBUTION_CONFIDENCE = 0.25
+DEFAULT_PERSONAL_BASELINE = 0.70
 
 _T = TypeVar("_T")
 
@@ -50,6 +60,27 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
     except (TypeError, ValueError, OverflowError):
         return default
     return result if math.isfinite(result) else default
+
+
+def _optional_unit_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    converted = _safe_float(value, math.nan)
+    if not math.isfinite(converted):
+        return None
+    return min(1.0, max(0.0, converted))
+
+
+def _safe_tags(value: Any) -> tuple[str, ...]:
+    if not isinstance(value, str) or not value.strip():
+        return ()
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return ()
+    if not isinstance(decoded, list):
+        return ()
+    return tuple(str(item)[:40] for item in decoded[:5] if str(item).strip())
 
 
 class LearningStore:
@@ -91,7 +122,9 @@ class LearningStore:
                     stability_days REAL NOT NULL,
                     last_reviewed_at TEXT,
                     last_score REAL,
-                    updated_at TEXT NOT NULL
+                    updated_at TEXT NOT NULL,
+                    difficulty REAL NOT NULL DEFAULT 0.5,
+                    difficulty_samples INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE TABLE IF NOT EXISTS review_events (
@@ -111,7 +144,16 @@ class LearningStore:
                     sentence TEXT,
                     reference_translation TEXT,
                     user_translation TEXT,
-                    feedback TEXT
+                    feedback TEXT,
+                    target_error_weight REAL,
+                    attribution_confidence REAL,
+                    non_target_error_tags TEXT,
+                    target_performance REAL,
+                    expected_performance REAL,
+                    effective_mastery_before REAL,
+                    attempts_before INTEGER NOT NULL DEFAULT 0,
+                    evaluator_profile TEXT,
+                    meaning_revealed INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_review_events_card_time
@@ -125,10 +167,10 @@ class LearningStore:
                 "SELECT value FROM meta WHERE key = 'schema_version'"
             ).fetchone()
             if version_row is None:
-                connection.execute(
-                    "INSERT INTO meta(key, value) VALUES('schema_version', ?)",
-                    (str(SCHEMA_VERSION),),
-                )
+                # A missing meta row may belong to a partially initialized old
+                # database. Column-aware migrations are idempotent for a truly
+                # new database and repair that case without discarding data.
+                self._migrate(connection, 0)
                 connection.execute(
                     "INSERT OR IGNORE INTO meta(key, value) VALUES('created_at', ?)",
                     (format_utc(utc_now()),),
@@ -171,6 +213,58 @@ class LearningStore:
                 "ON review_events(review_key) WHERE review_key IS NOT NULL"
             )
             version = 2
+
+        if version < 3:
+            progress_columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(progress)").fetchall()
+            }
+            if "difficulty" not in progress_columns:
+                connection.execute(
+                    "ALTER TABLE progress ADD COLUMN difficulty REAL NOT NULL DEFAULT 0.5"
+                )
+            if "difficulty_samples" not in progress_columns:
+                connection.execute(
+                    "ALTER TABLE progress ADD COLUMN difficulty_samples "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+
+            event_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(review_events)"
+                ).fetchall()
+            }
+            additions = {
+                "target_error_weight": "REAL",
+                "attribution_confidence": "REAL",
+                "non_target_error_tags": "TEXT",
+                "target_performance": "REAL",
+                "expected_performance": "REAL",
+                "effective_mastery_before": "REAL",
+                "attempts_before": "INTEGER NOT NULL DEFAULT 0",
+                "evaluator_profile": "TEXT",
+            }
+            for column, declaration in additions.items():
+                if column not in event_columns:
+                    connection.execute(
+                        f"ALTER TABLE review_events ADD COLUMN {column} {declaration}"
+                    )
+            version = 3
+
+        if version < 4:
+            event_columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(review_events)"
+                ).fetchall()
+            }
+            if "meaning_revealed" not in event_columns:
+                connection.execute(
+                    "ALTER TABLE review_events ADD COLUMN meaning_revealed "
+                    "INTEGER NOT NULL DEFAULT 0"
+                )
+            version = 4
 
         connection.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?) "
@@ -228,6 +322,8 @@ class LearningStore:
             last_reviewed_at=row["last_reviewed_at"],
             last_score=row["last_score"],
             updated_at=row["updated_at"],
+            difficulty=row["difficulty"],
+            difficulty_samples=row["difficulty_samples"],
         )
 
     @staticmethod
@@ -262,6 +358,23 @@ class LearningStore:
             review_key=(
                 row["review_key"] if isinstance(row["review_key"], str) else None
             ),
+            target_error_weight=_optional_unit_float(row["target_error_weight"]),
+            attribution_confidence=_optional_unit_float(
+                row["attribution_confidence"]
+            ),
+            non_target_error_tags=_safe_tags(row["non_target_error_tags"]),
+            target_performance=_optional_unit_float(row["target_performance"]),
+            expected_performance=_optional_unit_float(row["expected_performance"]),
+            effective_mastery_before=_optional_unit_float(
+                row["effective_mastery_before"]
+            ),
+            attempts_before=max(0, int(_safe_float(row["attempts_before"], 0.0))),
+            evaluator_profile=(
+                row["evaluator_profile"]
+                if isinstance(row["evaluator_profile"], str)
+                else None
+            ),
+            meaning_revealed=bool(row["meaning_revealed"]),
         )
 
     def schema_version(self) -> int:
@@ -328,6 +441,476 @@ class LearningStore:
     def list_progress(self, active_card_ids: Iterable[str] | None = None) -> dict[str, Progress]:
         return self.load_progress(active_card_ids)
 
+    @staticmethod
+    def _difficulty_epoch(connection: sqlite3.Connection) -> int:
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'difficulty_epoch_event_id'"
+        ).fetchone()
+        if row is None:
+            return 0
+        try:
+            return max(0, int(row["value"]))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _attempt_feature(attempts: int) -> float:
+        return min(1.0, math.log1p(max(0, attempts)) / math.log(11.0))
+
+    @staticmethod
+    def _effective_mastery_before(
+        progress: Progress | None,
+        reviewed_at: datetime,
+    ) -> float:
+        if (
+            progress is None
+            or progress.attempts <= 0
+            or progress.last_reviewed_at is None
+        ):
+            return 0.0
+        elapsed_days = max(
+            0.0,
+            (
+                ensure_utc(reviewed_at) - ensure_utc(progress.last_reviewed_at)
+            ).total_seconds()
+            / 86_400.0,
+        )
+        stability = max(0.25, float(progress.stability_days))
+        retention = math.exp(-elapsed_days / stability)
+        return min(1.0, max(0.0, progress.mastery * retention))
+
+    @classmethod
+    def _load_difficulty_model(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> dict[str, float | int | str]:
+        epoch = cls._difficulty_epoch(connection)
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'difficulty_model'"
+        ).fetchone()
+        if row is not None:
+            try:
+                candidate = json.loads(row["value"])
+                if (
+                    isinstance(candidate, dict)
+                    and candidate.get("version") == DIFFICULTY_MODEL_VERSION
+                    and int(candidate.get("epoch_event_id", -1)) == epoch
+                ):
+                    return {
+                        "version": DIFFICULTY_MODEL_VERSION,
+                        "epoch_event_id": epoch,
+                        "sample_count": max(0, int(candidate.get("sample_count", 0))),
+                        "baseline": min(
+                            0.98,
+                            max(0.05, float(candidate.get("baseline", DEFAULT_PERSONAL_BASELINE))),
+                        ),
+                        "mean_effective_mastery": min(
+                            1.0,
+                            max(0.0, float(candidate.get("mean_effective_mastery", 0.0))),
+                        ),
+                        "mean_attempt_feature": min(
+                            1.0,
+                            max(0.0, float(candidate.get("mean_attempt_feature", 0.0))),
+                        ),
+                        "effective_mastery_coefficient": min(
+                            1.0,
+                            max(
+                                0.0,
+                                float(candidate.get("effective_mastery_coefficient", 0.35)),
+                            ),
+                        ),
+                        "attempt_coefficient": min(
+                            0.30,
+                            max(0.0, float(candidate.get("attempt_coefficient", 0.05))),
+                        ),
+                    }
+            except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+                pass
+
+        rows = connection.execute(
+            """
+            SELECT target_performance, attribution_confidence,
+                   effective_mastery_before, attempts_before
+            FROM review_events
+            WHERE event_id > ? AND status = 'answered'
+              AND target_performance IS NOT NULL
+              AND attribution_confidence >= ?
+              AND meaning_revealed = 0
+            ORDER BY event_id DESC
+            LIMIT ?
+            """,
+            (epoch, MIN_ATTRIBUTION_CONFIDENCE, DIFFICULTY_MAX_TRAINING_EVENTS),
+        ).fetchall()
+        if not rows:
+            return {
+                "version": DIFFICULTY_MODEL_VERSION,
+                "epoch_event_id": epoch,
+                "sample_count": 0,
+                "baseline": DEFAULT_PERSONAL_BASELINE,
+                "mean_effective_mastery": 0.0,
+                "mean_attempt_feature": 0.0,
+                "effective_mastery_coefficient": 0.35,
+                "attempt_coefficient": 0.05,
+            }
+        weights = [
+            max(MIN_ATTRIBUTION_CONFIDENCE, _safe_float(row["attribution_confidence"]))
+            for row in rows
+        ]
+        total_weight = sum(weights)
+        baseline_prior_weight = 10.0
+        return {
+            "version": DIFFICULTY_MODEL_VERSION,
+            "epoch_event_id": epoch,
+            "sample_count": len(rows),
+            "baseline": (
+                baseline_prior_weight * DEFAULT_PERSONAL_BASELINE
+                + sum(
+                    weight
+                    * _safe_float(
+                        row["target_performance"], DEFAULT_PERSONAL_BASELINE
+                    )
+                    for row, weight in zip(rows, weights)
+                )
+            )
+            / (baseline_prior_weight + total_weight),
+            "mean_effective_mastery": sum(
+                weight * _safe_float(row["effective_mastery_before"])
+                for row, weight in zip(rows, weights)
+            )
+            / total_weight,
+            "mean_attempt_feature": sum(
+                weight * cls._attempt_feature(int(_safe_float(row["attempts_before"])))
+                for row, weight in zip(rows, weights)
+            )
+            / total_weight,
+            "effective_mastery_coefficient": 0.35,
+            "attempt_coefficient": 0.05,
+        }
+
+    @classmethod
+    def _expected_performance(
+        cls,
+        model: dict[str, float | int | str],
+        effective_mastery: float,
+        attempts_before: int,
+    ) -> float:
+        expected = (
+            float(model["baseline"])
+            + float(model["effective_mastery_coefficient"])
+            * (effective_mastery - float(model["mean_effective_mastery"]))
+            + float(model["attempt_coefficient"])
+            * (
+                cls._attempt_feature(attempts_before)
+                - float(model["mean_attempt_feature"])
+            )
+        )
+        return min(0.98, max(0.05, expected))
+
+    @classmethod
+    def _refresh_card_difficulty(
+        cls,
+        connection: sqlite3.Connection,
+        card_id: str,
+    ) -> None:
+        epoch = cls._difficulty_epoch(connection)
+        rows = connection.execute(
+            """
+            SELECT card_id, score, target_error_weight, attribution_confidence,
+                   target_performance, expected_performance, meaning_revealed
+            FROM review_events
+            WHERE event_id > ? AND status = 'answered'
+              AND target_performance IS NOT NULL
+              AND expected_performance IS NOT NULL
+              AND attribution_confidence >= ?
+            """,
+            (epoch, MIN_ATTRIBUTION_CONFIDENCE),
+        ).fetchall()
+        card_rows = [row for row in rows if row["card_id"] == card_id]
+        samples = len(card_rows)
+        difficulty = DEFAULT_DIFFICULTY
+        if samples >= MIN_DIFFICULTY_SAMPLES:
+            residual_weight = sum(
+                max(MIN_ATTRIBUTION_CONFIDENCE, _safe_float(row["attribution_confidence"]))
+                for row in card_rows
+            )
+            residual = sum(
+                max(MIN_ATTRIBUTION_CONFIDENCE, _safe_float(row["attribution_confidence"]))
+                * (
+                    _safe_float(row["expected_performance"], DEFAULT_PERSONAL_BASELINE)
+                    - (
+                        0.0
+                        if bool(row["meaning_revealed"])
+                        else _safe_float(
+                            row["target_performance"], DEFAULT_PERSONAL_BASELINE
+                        )
+                    )
+                )
+                for row in card_rows
+            ) / max(residual_weight, 1e-9)
+
+            def attributed_error_average(source: list[sqlite3.Row]) -> float | None:
+                weighted_sum = 0.0
+                total = 0.0
+                for row in source:
+                    sentence_loss = (
+                        1.0
+                        if bool(row["meaning_revealed"])
+                        else max(0.0, 1.0 - _safe_float(row["score"]) / 100.0)
+                    )
+                    weight = (
+                        sentence_loss
+                        * max(
+                            MIN_ATTRIBUTION_CONFIDENCE,
+                            _safe_float(row["attribution_confidence"]),
+                        )
+                    )
+                    weighted_sum += weight * _safe_float(row["target_error_weight"])
+                    total += weight
+                return None if total <= 1e-9 else weighted_sum / total
+
+            card_attribution = attributed_error_average(card_rows)
+            global_attribution = attributed_error_average(rows)
+            attribution_excess = (
+                0.0
+                if card_attribution is None or global_attribution is None
+                else card_attribution - global_attribution
+            )
+            reliability = samples / (samples + 5.0)
+            signal = 0.80 * residual + 0.20 * attribution_excess
+            difficulty = min(1.0, max(0.0, 0.50 + reliability * signal))
+
+        connection.execute(
+            "UPDATE progress SET difficulty = ?, difficulty_samples = ? WHERE card_id = ?",
+            (difficulty, samples, card_id),
+        )
+
+    @classmethod
+    def _difficulty_event_count(cls, connection: sqlite3.Connection) -> int:
+        epoch = cls._difficulty_epoch(connection)
+        row = connection.execute(
+            """
+            SELECT COUNT(*) AS count
+            FROM review_events
+            WHERE event_id > ? AND status = 'answered'
+              AND target_performance IS NOT NULL
+              AND attribution_confidence >= ?
+              AND meaning_revealed = 0
+            """,
+            (epoch, MIN_ATTRIBUTION_CONFIDENCE),
+        ).fetchone()
+        return 0 if row is None else max(0, int(row["count"]))
+
+    @classmethod
+    def _difficulty_recalibration_due_in_connection(
+        cls,
+        connection: sqlite3.Connection,
+    ) -> bool:
+        count = cls._difficulty_event_count(connection)
+        if count < DIFFICULTY_MIN_GLOBAL_SAMPLES:
+            return False
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'difficulty_model'"
+        ).fetchone()
+        if row is None:
+            return True
+        try:
+            model = json.loads(row["value"])
+            if (
+                not isinstance(model, dict)
+                or model.get("version") != DIFFICULTY_MODEL_VERSION
+                or int(model.get("epoch_event_id", -1))
+                != cls._difficulty_epoch(connection)
+            ):
+                return True
+            trained_count = int(model.get("sample_count", 0))
+        except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+            return True
+        return trained_count > count or count - trained_count >= DIFFICULTY_RETRAIN_INTERVAL
+
+    def difficulty_recalibration_due(self) -> bool:
+        def operation() -> bool:
+            with closing(self._connect()) as connection:
+                return self._difficulty_recalibration_due_in_connection(connection)
+
+        return self._run_with_recovery(operation)
+
+    def difficulty_status(self) -> dict[str, Any]:
+        """Return safe, user-facing calibration progress without event contents."""
+
+        def operation() -> dict[str, Any]:
+            with closing(self._connect()) as connection:
+                count = self._difficulty_event_count(connection)
+                row = connection.execute(
+                    "SELECT value FROM meta WHERE key = 'difficulty_model'"
+                ).fetchone()
+                trained = False
+                trained_count = 0
+                baseline: float | None = None
+                if row is not None:
+                    try:
+                        model = json.loads(row["value"])
+                        trained = bool(
+                            isinstance(model, dict)
+                            and model.get("version") == DIFFICULTY_MODEL_VERSION
+                            and int(model.get("epoch_event_id", -1))
+                            == self._difficulty_epoch(connection)
+                        )
+                        if trained:
+                            trained_count = max(0, int(model.get("sample_count", 0)))
+                            baseline = min(
+                                1.0,
+                                max(0.0, float(model.get("baseline"))),
+                            )
+                    except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+                        trained = False
+                next_training_at = (
+                    DIFFICULTY_MIN_GLOBAL_SAMPLES
+                    if not trained
+                    else max(
+                        DIFFICULTY_MIN_GLOBAL_SAMPLES,
+                        trained_count + DIFFICULTY_RETRAIN_INTERVAL,
+                    )
+                )
+                return {
+                    "valid_samples": count,
+                    "trained": trained,
+                    "trained_samples": trained_count,
+                    "baseline": baseline,
+                    "next_training_at": next_training_at,
+                }
+
+        return self._run_with_recovery(operation)
+
+    def recalibrate_difficulty(self, *, force: bool = False) -> bool:
+        """Fit the tiny personal calibration model and refresh item difficulty."""
+
+        def operation() -> bool:
+            with closing(self._connect()) as connection, connection:
+                connection.execute("BEGIN IMMEDIATE")
+                if not force and not self._difficulty_recalibration_due_in_connection(
+                    connection
+                ):
+                    return False
+                epoch = self._difficulty_epoch(connection)
+                rows = connection.execute(
+                    """
+                    SELECT event_id, target_performance, attribution_confidence,
+                           effective_mastery_before, attempts_before
+                    FROM review_events
+                    WHERE event_id > ? AND status = 'answered'
+                      AND target_performance IS NOT NULL
+                      AND attribution_confidence >= ?
+                      AND meaning_revealed = 0
+                    ORDER BY event_id DESC
+                    LIMIT ?
+                    """,
+                    (
+                        epoch,
+                        MIN_ATTRIBUTION_CONFIDENCE,
+                        DIFFICULTY_MAX_TRAINING_EVENTS,
+                    ),
+                ).fetchall()
+                if not rows:
+                    return False
+
+                weighted_rows: list[tuple[sqlite3.Row, float]] = []
+                for age, row in enumerate(rows):
+                    confidence = max(
+                        MIN_ATTRIBUTION_CONFIDENCE,
+                        _safe_float(row["attribution_confidence"]),
+                    )
+                    weighted_rows.append((row, confidence * (0.995**age)))
+                total_weight = sum(weight for _, weight in weighted_rows)
+                baseline = sum(
+                    weight * _safe_float(row["target_performance"], DEFAULT_PERSONAL_BASELINE)
+                    for row, weight in weighted_rows
+                ) / total_weight
+                mean_effective = sum(
+                    weight * _safe_float(row["effective_mastery_before"])
+                    for row, weight in weighted_rows
+                ) / total_weight
+                mean_attempt = sum(
+                    weight
+                    * self._attempt_feature(int(_safe_float(row["attempts_before"])))
+                    for row, weight in weighted_rows
+                ) / total_weight
+
+                s11 = s12 = s22 = t1 = t2 = 0.0
+                for row, weight in weighted_rows:
+                    x1 = _safe_float(row["effective_mastery_before"]) - mean_effective
+                    x2 = (
+                        self._attempt_feature(int(_safe_float(row["attempts_before"])))
+                        - mean_attempt
+                    )
+                    centered_y = _safe_float(row["target_performance"]) - baseline
+                    s11 += weight * x1 * x1
+                    s12 += weight * x1 * x2
+                    s22 += weight * x2 * x2
+                    t1 += weight * x1 * centered_y
+                    t2 += weight * x2 * centered_y
+                ridge = max(1.0, total_weight * 0.15)
+                s11 += ridge
+                s22 += ridge
+                determinant = s11 * s22 - s12 * s12
+                if abs(determinant) <= 1e-12:
+                    effective_coefficient, attempt_coefficient = 0.35, 0.05
+                else:
+                    effective_coefficient = (t1 * s22 - t2 * s12) / determinant
+                    attempt_coefficient = (s11 * t2 - s12 * t1) / determinant
+                effective_coefficient = min(1.0, max(0.0, effective_coefficient))
+                attempt_coefficient = min(0.30, max(0.0, attempt_coefficient))
+                total_count = self._difficulty_event_count(connection)
+                model: dict[str, float | int | str] = {
+                    "version": DIFFICULTY_MODEL_VERSION,
+                    "epoch_event_id": epoch,
+                    "sample_count": total_count,
+                    "baseline": min(0.98, max(0.05, baseline)),
+                    "mean_effective_mastery": min(1.0, max(0.0, mean_effective)),
+                    "mean_attempt_feature": min(1.0, max(0.0, mean_attempt)),
+                    "effective_mastery_coefficient": effective_coefficient,
+                    "attempt_coefficient": attempt_coefficient,
+                }
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES('difficulty_model', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (json.dumps(model, ensure_ascii=False, separators=(",", ":")),),
+                )
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES('difficulty_model_updated_at', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (format_utc(utc_now()),),
+                )
+
+                all_rows = connection.execute(
+                    """
+                    SELECT event_id, effective_mastery_before, attempts_before
+                    FROM review_events
+                    WHERE event_id > ? AND status = 'answered'
+                      AND target_performance IS NOT NULL
+                      AND attribution_confidence >= ?
+                      AND meaning_revealed = 0
+                    """,
+                    (epoch, MIN_ATTRIBUTION_CONFIDENCE),
+                ).fetchall()
+                for row in all_rows:
+                    expected = self._expected_performance(
+                        model,
+                        _safe_float(row["effective_mastery_before"]),
+                        int(_safe_float(row["attempts_before"])),
+                    )
+                    connection.execute(
+                        "UPDATE review_events SET expected_performance = ? WHERE event_id = ?",
+                        (expected, row["event_id"]),
+                    )
+                progress_rows = connection.execute(
+                    "SELECT card_id FROM progress"
+                ).fetchall()
+                for row in progress_rows:
+                    self._refresh_card_difficulty(connection, row["card_id"])
+                return True
+
+        return self._run_with_recovery(operation)
+
     def record_review(
         self,
         card: Card | str,
@@ -340,6 +923,11 @@ class LearningStore:
         user_translation: str | None = None,
         feedback: str | None = None,
         review_key: str | None = None,
+        target_error_weight: float | None = None,
+        attribution_confidence: float | None = None,
+        non_target_error_tags: Iterable[str] = (),
+        evaluator_profile: str | None = None,
+        meaning_revealed: bool = False,
         word: str = "",
         pos: str = "",
         meaning: str = "",
@@ -379,7 +967,44 @@ class LearningStore:
         normalized_review_key = None
         if review_key is not None:
             normalized_review_key = str(review_key).strip() or None
-        timestamp = reviewed_at or utc_now()
+        normalized_error_weight: float | None = None
+        normalized_confidence: float | None = None
+        normalized_tags: tuple[str, ...] = ()
+        normalized_profile: str | None = None
+        normalized_meaning_revealed = bool(
+            meaning_revealed and status == "answered"
+        )
+        if status == "answered" and (
+            target_error_weight is not None or attribution_confidence is not None
+        ):
+            if target_error_weight is None or attribution_confidence is None:
+                raise ValueError(
+                    "target_error_weight and attribution_confidence must be provided together"
+                )
+            normalized_error_weight = _optional_unit_float(target_error_weight)
+            normalized_confidence = _optional_unit_float(attribution_confidence)
+            if normalized_error_weight is None or normalized_confidence is None:
+                raise ValueError("attribution values must be finite numbers between 0 and 1")
+            allowed_tags = {
+                "context_vocabulary",
+                "grammar",
+                "omission",
+                "chinese_expression",
+                "overtranslation",
+                "other",
+            }
+            collected_tags: list[str] = []
+            for item in non_target_error_tags:
+                tag = str(item).strip()
+                if tag not in allowed_tags:
+                    raise ValueError(f"unsupported non-target error tag: {tag}")
+                if tag not in collected_tags:
+                    collected_tags.append(tag)
+                if len(collected_tags) >= 5:
+                    break
+            normalized_tags = tuple(collected_tags)
+            normalized_profile = _safe_text(evaluator_profile).strip()[:200] or None
+        timestamp = ensure_utc(reviewed_at or utc_now())
 
         def operation() -> Progress:
             with closing(self._connect()) as connection, connection:
@@ -405,6 +1030,28 @@ class LearningStore:
                     "SELECT * FROM progress WHERE card_id = ?", (card_id,)
                 ).fetchone()
                 before = None if row is None else self._row_to_progress(row)
+                attempts_before = 0 if before is None else before.attempts
+                effective_mastery_before = self._effective_mastery_before(
+                    before,
+                    timestamp,
+                )
+                target_performance: float | None = None
+                expected_performance: float | None = None
+                if (
+                    normalized_error_weight is not None
+                    and normalized_confidence is not None
+                ):
+                    sentence_loss = 1.0 - normalized_score / 100.0
+                    target_performance = min(
+                        1.0,
+                        max(0.0, 1.0 - sentence_loss * normalized_error_weight),
+                    )
+                    model = self._load_difficulty_model(connection)
+                    expected_performance = self._expected_performance(
+                        model,
+                        effective_mastery_before,
+                        attempts_before,
+                    )
                 after = evolve_progress(
                     card_id,
                     before,
@@ -415,15 +1062,18 @@ class LearningStore:
                     """
                     INSERT INTO progress(
                         card_id, attempts, mastery, stability_days,
-                        last_reviewed_at, last_score, updated_at
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?)
+                        last_reviewed_at, last_score, updated_at,
+                        difficulty, difficulty_samples
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(card_id) DO UPDATE SET
                         attempts = excluded.attempts,
                         mastery = excluded.mastery,
                         stability_days = excluded.stability_days,
                         last_reviewed_at = excluded.last_reviewed_at,
                         last_score = excluded.last_score,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        difficulty = excluded.difficulty,
+                        difficulty_samples = excluded.difficulty_samples
                     """,
                     (
                         after.card_id,
@@ -433,6 +1083,8 @@ class LearningStore:
                         format_utc(after.last_reviewed_at),
                         after.last_score,
                         format_utc(after.updated_at),
+                        after.difficulty,
+                        after.difficulty_samples,
                     ),
                 )
                 before_mastery = 0.0 if before is None else before.mastery
@@ -443,8 +1095,12 @@ class LearningStore:
                         review_key, card_id, word, pos, meaning, reviewed_at, score, status,
                         mastery_before, mastery_after,
                         stability_before, stability_after,
-                        sentence, reference_translation, user_translation, feedback
-                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        sentence, reference_translation, user_translation, feedback,
+                        target_error_weight, attribution_confidence,
+                        non_target_error_tags, target_performance,
+                        expected_performance, effective_mastery_before,
+                        attempts_before, evaluator_profile, meaning_revealed
+                    ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         normalized_review_key,
@@ -463,9 +1119,34 @@ class LearningStore:
                         reference_translation,
                         user_translation,
                         feedback,
+                        normalized_error_weight,
+                        normalized_confidence,
+                        (
+                            None
+                            if normalized_error_weight is None
+                            else json.dumps(
+                                normalized_tags,
+                                ensure_ascii=False,
+                                separators=(",", ":"),
+                            )
+                        ),
+                        target_performance,
+                        expected_performance,
+                        (
+                            None
+                            if normalized_error_weight is None
+                            else effective_mastery_before
+                        ),
+                        attempts_before,
+                        normalized_profile,
+                        int(normalized_meaning_revealed),
                     ),
                 )
-                return after
+                self._refresh_card_difficulty(connection, card_id)
+                refreshed = connection.execute(
+                    "SELECT * FROM progress WHERE card_id = ?", (card_id,)
+                ).fetchone()
+                return after if refreshed is None else self._row_to_progress(refreshed)
 
         return self._run_with_recovery(operation)
 
@@ -497,11 +1178,24 @@ class LearningStore:
         return self.list_review_events(**kwargs)
 
     def reset_progress(self) -> int:
-        """Clear scheduling state while preserving immutable review history."""
+        """Clear scheduling/difficulty state while preserving visible history."""
 
         def operation() -> int:
             with closing(self._connect()) as connection, connection:
+                latest = connection.execute(
+                    "SELECT COALESCE(MAX(event_id), 0) AS event_id FROM review_events"
+                ).fetchone()
+                epoch_event_id = 0 if latest is None else int(latest["event_id"])
                 cursor = connection.execute("DELETE FROM progress")
+                connection.execute(
+                    "DELETE FROM meta WHERE key IN "
+                    "('difficulty_model', 'difficulty_model_updated_at')"
+                )
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES('difficulty_epoch_event_id', ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (str(epoch_event_id),),
+                )
                 connection.execute(
                     "INSERT INTO meta(key, value) VALUES('progress_reset_at', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -533,6 +1227,14 @@ class LearningStore:
             with closing(self._connect()) as connection, connection:
                 progress_cursor = connection.execute("DELETE FROM progress")
                 history_cursor = connection.execute("DELETE FROM review_events")
+                connection.execute(
+                    "DELETE FROM meta WHERE key IN "
+                    "('difficulty_model', 'difficulty_model_updated_at')"
+                )
+                connection.execute(
+                    "INSERT INTO meta(key, value) VALUES('difficulty_epoch_event_id', '0') "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value"
+                )
                 connection.execute(
                     "INSERT INTO meta(key, value) VALUES('all_cleared_at', ?) "
                     "ON CONFLICT(key) DO UPDATE SET value = excluded.value",

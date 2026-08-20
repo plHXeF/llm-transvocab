@@ -80,5 +80,5 @@ VOCAB_FILE = os.getenv("VOCAB_FILE", str(PROJECT_ROOT / "vocabularies.csv"))
 # --- Streamlit page -------------------------------------------------------
 
 PAGE_TITLE = "英语词汇学习系统"
-PAGE_ICON = "📚"
+PAGE_ICON = None
 PAGE_LAYOUT = "wide"
