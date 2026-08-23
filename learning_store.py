@@ -221,13 +221,24 @@ class LearningStore:
             }
             if "difficulty" not in progress_columns:
                 connection.execute(
-                    "ALTER TABLE progress ADD COLUMN difficulty REAL NOT NULL DEFAULT 0.5"
+                    "ALTER TABLE progress ADD COLUMN difficulty REAL DEFAULT 0.5"
                 )
             if "difficulty_samples" not in progress_columns:
                 connection.execute(
                     "ALTER TABLE progress ADD COLUMN difficulty_samples "
-                    "INTEGER NOT NULL DEFAULT 0"
+                    "INTEGER DEFAULT 0"
                 )
+            # Some SQLite versions report a failed quick_check when a
+            # NOT NULL column is added directly to a populated legacy table.
+            # Explicitly backfill migrated rows; newly created databases keep
+            # the stricter declarations from CREATE TABLE above.
+            connection.execute(
+                "UPDATE progress SET difficulty = 0.5 WHERE difficulty IS NULL"
+            )
+            connection.execute(
+                "UPDATE progress SET difficulty_samples = 0 "
+                "WHERE difficulty_samples IS NULL"
+            )
 
             event_columns = {
                 row[1]
@@ -242,7 +253,7 @@ class LearningStore:
                 "target_performance": "REAL",
                 "expected_performance": "REAL",
                 "effective_mastery_before": "REAL",
-                "attempts_before": "INTEGER NOT NULL DEFAULT 0",
+                "attempts_before": "INTEGER DEFAULT 0",
                 "evaluator_profile": "TEXT",
             }
             for column, declaration in additions.items():
@@ -250,6 +261,10 @@ class LearningStore:
                     connection.execute(
                         f"ALTER TABLE review_events ADD COLUMN {column} {declaration}"
                     )
+            connection.execute(
+                "UPDATE review_events SET attempts_before = 0 "
+                "WHERE attempts_before IS NULL"
+            )
             version = 3
 
         if version < 4:
@@ -262,8 +277,12 @@ class LearningStore:
             if "meaning_revealed" not in event_columns:
                 connection.execute(
                     "ALTER TABLE review_events ADD COLUMN meaning_revealed "
-                    "INTEGER NOT NULL DEFAULT 0"
+                    "INTEGER DEFAULT 0"
                 )
+            connection.execute(
+                "UPDATE review_events SET meaning_revealed = 0 "
+                "WHERE meaning_revealed IS NULL"
+            )
             version = 4
 
         connection.execute(
