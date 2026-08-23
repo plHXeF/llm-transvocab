@@ -199,22 +199,6 @@ conda run -n english python -m pip check
 
 测试覆盖模型参数与密钥脱敏、结构化输出修复、错误归因、个人难度校准、词库导入、SQLite 迁移、遗忘曲线、同词多义隔离、预缓存失效、Streamlit 页面状态流和数据清理。
 
-## 自动构建 Release
-
-仓库的 `Desktop Release` 工作流会分别在 GitHub 托管的 Windows x64、macOS Apple Silicon 和 macOS Intel 环境中验证并打包应用：
-
-- 在 GitHub Actions 页面手动运行时，只生成保留 14 天的测试构建产物。
-- 推送 `v*` 标签时，在三种构建全部成功后自动创建 GitHub Release，并附带 ZIP 与 SHA-256 文件。
-
-例如发布 `v0.1.0`：
-
-```bash
-git tag v0.1.0
-git push origin v0.1.0
-```
-
-构建仅使用仓库源码和公开依赖，不读取本机 `data/`，也不包含任何 API Key。桌面包目前不做 Windows 或 Apple 代码签名。
-
 ## 项目结构
 
 ```text
