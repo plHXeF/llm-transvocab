@@ -15,3 +15,9 @@ venv/
 data/
 .streamlit/secrets.toml
 .streamlit/credentials.toml
+
+# Local desktop-build output.
+build/
+dist/
+*.zip
+*.sha256

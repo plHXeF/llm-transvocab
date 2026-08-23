@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 import re
 import threading
 import time
@@ -868,6 +869,10 @@ def _render_sidebar(
         st.markdown("---")
         _render_model_diagnostics(error_log)
         _render_reset_controls(learning_store)
+        if os.getenv("VOCAB_DESKTOP_MODE") == "1":
+            st.markdown("---")
+            if st.button("退出应用", width="stretch"):
+                os._exit(0)
     return page
 
 

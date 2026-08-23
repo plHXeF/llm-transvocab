@@ -21,6 +21,27 @@
 
 ## 快速开始
 
+### 下载桌面版
+
+不想安装 Python 时，可以从 [GitHub Releases](https://github.com/plHXeF/llm-transvocab/releases) 下载与电脑匹配的压缩包：
+
+| 系统 | 下载文件 |
+| --- | --- |
+| Windows 10/11 64 位 | `llm-transvocab-windows-x64.zip` |
+| Apple 芯片 Mac | `llm-transvocab-macos-arm64.zip` |
+| Intel Mac | `llm-transvocab-macos-x64.zip` |
+
+解压后直接运行 `LLM TransVocab`。程序会在本机启动服务并自动打开浏览器；使用完毕可在左侧点击“退出应用”。这些社区构建不包含代码签名：Windows 首次运行可能显示 SmartScreen，macOS 首次运行可能需要在 Finder 中右键应用并选择“打开”。
+
+桌面版把设置、Key、学习历史、错误日志和可编辑词库放在用户数据目录，更新应用不会覆盖它们：
+
+- macOS：`~/Library/Application Support/LLM TransVocab/`
+- Windows：`%LOCALAPPDATA%\LLM TransVocab\`
+
+压缩包旁的 `.sha256` 文件可用于核对下载完整性。
+
+### 从源码运行
+
 推荐 Python 3.11。本项目开发和测试使用 conda 环境：
 
 ```bash
@@ -178,6 +199,22 @@ conda run -n english python -m pip check
 
 测试覆盖模型参数与密钥脱敏、结构化输出修复、错误归因、个人难度校准、词库导入、SQLite 迁移、遗忘曲线、同词多义隔离、预缓存失效、Streamlit 页面状态流和数据清理。
 
+## 自动构建 Release
+
+仓库的 `Desktop Release` 工作流会分别在 GitHub 托管的 Windows x64、macOS Apple Silicon 和 macOS Intel 环境中验证并打包应用：
+
+- 在 GitHub Actions 页面手动运行时，只生成保留 14 天的测试构建产物。
+- 推送 `v*` 标签时，在三种构建全部成功后自动创建 GitHub Release，并附带 ZIP 与 SHA-256 文件。
+
+例如发布 `v0.1.0`：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+构建仅使用仓库源码和公开依赖，不读取本机 `data/`，也不包含任何 API Key。桌面包目前不做 Windows 或 Apple 代码签名。
+
 ## 项目结构
 
 ```text
@@ -189,6 +226,9 @@ learning_store.py         SQLite 进度、历史与迁移
 scheduler.py              熟练度、遗忘曲线和批次选择
 prefetch.py               下一题后台预缓存
 model_error_log.py        脱敏模型错误日志
+desktop_launcher.py       桌面包启动与浏览器打开
+desktop_runtime.py        桌面版用户数据目录和首次初始化
+packaging/                PyInstaller 构建配置
 domain.py                 Card、Progress 等领域对象
 tests/                    标准库 unittest 测试
 ```
