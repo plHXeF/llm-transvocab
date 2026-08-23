@@ -46,7 +46,8 @@ class ModelErrorLogTests(unittest.TestCase):
         self.assertNotIn("password", payload)
         self.assertNotIn("query-secret", payload)
         self.assertEqual(entry.endpoint, "https://gateway.example:8443")
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
 
     def test_model_and_request_id_are_redacted_too(self):
         settings = LLMSettings(
@@ -124,7 +125,8 @@ class ModelErrorLogTests(unittest.TestCase):
         self.assertEqual(log.clear(), 2)
         self.assertEqual(log.list_entries(), [])
         self.assertEqual(self.path.read_text(encoding="utf-8"), "")
-        self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(os.stat(self.path).st_mode & 0o777, 0o600)
 
 
 if __name__ == "__main__":

@@ -49,8 +49,9 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertEqual(loaded.llm.reasoning_effort, ReasoningEffort.MEDIUM)
         self.assertEqual(loaded.llm.api_key, self.secret)
         self.assertEqual(loaded.sentence_difficulty, SentenceDifficulty.IELTS)
-        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.keys_path.stat().st_mode & 0o777, 0o600)
+        if os.name != "nt":
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.keys_path.stat().st_mode & 0o777, 0o600)
         self.assertNotIn(self.secret, self.path.read_text(encoding="utf-8"))
         payload = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(payload["version"], 3)
@@ -241,6 +242,7 @@ class SettingsStoreTests(unittest.TestCase):
         self.assertTrue(new_keys.exists())
         self.assertIn("replacement", new_keys.read_text(encoding="utf-8"))
 
+    @unittest.skipIf(os.name == "nt", "Windows does not expose POSIX mode bits")
     def test_load_tightens_unsafe_file_modes(self):
         self.store.save(self.settings)
         os.chmod(self.path, 0o644)

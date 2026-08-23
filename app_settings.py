@@ -374,7 +374,8 @@ def _atomic_write(path: Path, content: str) -> None:
     )
     temporary_path = Path(temporary_name)
     try:
-        os.fchmod(file_descriptor, 0o600)
+        if hasattr(os, "fchmod"):
+            os.fchmod(file_descriptor, 0o600)
         with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
             file_descriptor = -1
             handle.write(content)

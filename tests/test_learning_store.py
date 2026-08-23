@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
@@ -353,7 +354,7 @@ class LearningStoreTests(unittest.TestCase):
         self.assertIsNotNone(self.store.get_progress(self.card.card_id))
 
     def test_malformed_progress_values_are_sanitized(self) -> None:
-        with sqlite3.connect(self.db_path) as connection:
+        with closing(sqlite3.connect(self.db_path)) as connection, connection:
             connection.execute(
                 """
                 INSERT INTO progress(
@@ -402,7 +403,7 @@ class LearningStoreTests(unittest.TestCase):
     def test_v1_database_migrates_without_losing_progress_or_history(self) -> None:
         legacy_path = Path(self.temp_dir.name) / "legacy-v1.db"
         reviewed_at = "2026-08-15T08:30:00.000000Z"
-        with sqlite3.connect(legacy_path) as connection:
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
             connection.executescript(
                 """
                 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -471,7 +472,7 @@ class LearningStoreTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].feedback, "legacy")
         self.assertIsNone(events[0].review_key)
-        with sqlite3.connect(legacy_path) as connection:
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
             columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(review_events)")
             }
@@ -480,7 +481,7 @@ class LearningStoreTests(unittest.TestCase):
             }
         self.assertIn("review_key", columns)
         self.assertIn("idx_review_events_review_key", indexes)
-        with sqlite3.connect(legacy_path) as connection:
+        with closing(sqlite3.connect(legacy_path)) as connection, connection:
             progress_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(progress)")
             }
