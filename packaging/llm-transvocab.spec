@@ -13,6 +13,7 @@ PROJECT_MODULES = [
     "config",
     "desktop_runtime",
     "domain",
+    "learning_charts",
     "learning_store",
     "llm_service",
     "model_error_log",

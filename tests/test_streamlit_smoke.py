@@ -66,6 +66,49 @@ class StreamlitSmokeTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertIn("词库管理", [header.value for header in app.header])
 
+    def test_learning_visualizations_render_and_handle_vocabulary_changes(self):
+        first = Card("appeal", "n", "呼吁")
+        second = Card("appeal", "v", "吸引")
+        self.vocabulary_path.write_text(
+            "word,pos,meaning\nappeal,n,呼吁\nappeal,v,吸引\n", encoding="utf-8")
+        store = LearningStore(config.LEARNING_DB_FILE)
+        for index in range(30):
+            store.record_review(first if index % 2 else second, 80,
+                                target_error_weight=1, attribution_confidence=1)
+        store.recalibrate_difficulty()
+        original_events = store.list_review_events()
+        original_progress = store.load_progress()
+        with patch.object(llm_service.LLMService, "generate_sentence",
+                          side_effect=AssertionError("Unexpected generation")), \
+             patch.object(llm_service.LLMService, "evaluate_translation",
+                          side_effect=AssertionError("Unexpected evaluation")), \
+             patch.object(LearningStore, "recalibrate_difficulty",
+                          side_effect=AssertionError("Unexpected calibration")):
+            app = AppTest.from_file(str(PROJECT_ROOT / "vocab_web.py")).run(timeout=30)
+            app.radio(key="page_navigation").set_value("学习数据").run(timeout=30)
+            self.assertFalse(app.exception)
+            expanders = {element.label: element for element in app.expander}
+            self.assertFalse(expanders["遗忘曲线"].proto.expanded)
+            self.assertFalse(expanders["个人基线"].proto.expanded)
+            self.assertEqual(app.selectbox(key="forgetting_card").options,
+                             ["appeal · v · 吸引", "appeal · n · 呼吁"])
+            self.assertEqual(app.selectbox(key="forgetting_days").value, 30)
+            app.selectbox(key="forgetting_card").set_value(first.card_id).run(timeout=30)
+            app.selectbox(key="forgetting_days").set_value(90).run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(store.list_review_events(), original_events)
+            self.assertEqual(store.load_progress(), original_progress)
+            self.vocabulary_path.write_text("word,pos,meaning\nappeal,v,吸引\n",
+                                            encoding="utf-8")
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertEqual(app.selectbox(key="forgetting_card").value, second.card_id)
+            store.reset_progress()
+            app.run(timeout=30)
+            self.assertFalse(app.exception)
+            self.assertTrue(any("暂无可展示" in info.value for info in app.info))
+            self.assertTrue(any("正在收集有效样本：0/30" in info.value for info in app.info))
+
     def test_mixed_optional_model_diagnostics_are_arrow_safe(self):
         entries = [
             ModelErrorEntry(

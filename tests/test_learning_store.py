@@ -168,6 +168,71 @@ class LearningStoreTests(unittest.TestCase):
         )
         self.assertTrue(self.store.difficulty_recalibration_due())
 
+    def test_baseline_visualization_is_read_only_and_uses_current_model(self):
+        collecting = self.store.baseline_visualization()
+        self.assertFalse(collecting["status"]["trained"])
+        self.assertEqual(collecting["samples"], [])
+        for index in range(30):
+            self.store.record_review(
+                Card(f"valid-{index}", "n", "meaning"), 75,
+                target_error_weight=1, attribution_confidence=0.9,
+            )
+        self.store.recalibrate_difficulty()
+        self.store.record_review(self.card, None, status="skipped")
+        self.store.record_review(self.card, 50, target_error_weight=1,
+                                 attribution_confidence=0.2)
+        self.store.record_review(self.card, 50, target_error_weight=1,
+                                 attribution_confidence=1, meaning_revealed=True)
+        self.store.record_review(self.card, 50)
+        # A post-training sample is predicted with the same current model.
+        self.store.record_review(self.card, 60, target_error_weight=1,
+                                 attribution_confidence=0.9)
+        with closing(self.store._connect()) as connection:
+            before = connection.iterdump()
+            before = list(before)
+        model = json.loads(self.store.get_meta("difficulty_model"))
+        snapshot = self.store.baseline_visualization()
+        self.assertEqual(snapshot["status"]["valid_samples"], 31)
+        self.assertEqual(len(snapshot["samples"]), 31)
+        self.assertTrue(snapshot["status"]["trained"])
+        for sample in snapshot["samples"]:
+            self.assertAlmostEqual(sample["expected_performance"],
+                self.store._expected_performance(model,
+                    sample["effective_mastery_before"], sample["attempts_before"]))
+            self.assertNotIn("user_translation", sample)
+        with closing(self.store._connect()) as connection:
+            self.assertEqual(list(connection.iterdump()), before)
+        self.store.reset_progress()
+        snapshot = self.store.baseline_visualization()
+        self.assertEqual(snapshot["status"]["valid_samples"], 0)
+        self.assertFalse(snapshot["status"]["trained"])
+        self.assertEqual(snapshot["samples"], [])
+        for index in range(30):
+            self.store.record_review(Card(f"new-{index}", "n", "meaning"), 90,
+                                     target_error_weight=1, attribution_confidence=1)
+        self.store.recalibrate_difficulty()
+        self.assertTrue(all(sample["word"].startswith("new-")
+                            for sample in self.store.baseline_visualization()["samples"]))
+
+    def test_baseline_visualization_caps_at_latest_thousand_samples(self):
+        for index in range(30):
+            self.store.record_review(self.card, 80, target_error_weight=1,
+                                     attribution_confidence=1)
+        self.store.recalibrate_difficulty()
+        with closing(self.store._connect()) as connection, connection:
+            columns = [row["name"] for row in connection.execute(
+                "PRAGMA table_info(review_events)") if row["name"] not in
+                ("event_id", "review_key")]
+            fields = ", ".join(columns)
+            for _ in range(975):
+                connection.execute(f"INSERT INTO review_events ({fields}) "
+                                   f"SELECT {fields} FROM review_events LIMIT 1")
+        snapshot = self.store.baseline_visualization()
+        self.assertEqual(snapshot["status"]["valid_samples"], 1005)
+        ids = [sample["event_id"] for sample in snapshot["samples"]]
+        self.assertEqual(len(ids), 1000)
+        self.assertEqual(ids, list(range(1005, 5, -1)))
+
     def test_reset_progress_starts_a_new_difficulty_epoch(self) -> None:
         for index in range(3):
             progress = self.store.record_review(

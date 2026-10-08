@@ -753,50 +753,89 @@ class LearningStore:
 
         return self._run_with_recovery(operation)
 
+    def _difficulty_status_in_connection(
+        self, connection: sqlite3.Connection
+    ) -> dict[str, Any]:
+        count = self._difficulty_event_count(connection)
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'difficulty_model'"
+        ).fetchone()
+        trained = False
+        trained_count = 0
+        baseline: float | None = None
+        if row is not None:
+            try:
+                model = json.loads(row["value"])
+                trained = bool(
+                    isinstance(model, dict)
+                    and model.get("version") == DIFFICULTY_MODEL_VERSION
+                    and int(model.get("epoch_event_id", -1))
+                    == self._difficulty_epoch(connection)
+                )
+                if trained:
+                    trained_count = max(0, int(model.get("sample_count", 0)))
+                    baseline = min(
+                        1.0,
+                        max(0.0, float(model.get("baseline"))),
+                    )
+            except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
+                trained = False
+        next_training_at = (
+            DIFFICULTY_MIN_GLOBAL_SAMPLES
+            if not trained
+            else max(
+                DIFFICULTY_MIN_GLOBAL_SAMPLES,
+                trained_count + DIFFICULTY_RETRAIN_INTERVAL,
+            )
+        )
+        return {
+            "valid_samples": count,
+            "trained": trained,
+            "trained_samples": trained_count,
+            "baseline": baseline,
+            "next_training_at": next_training_at,
+        }
+
     def difficulty_status(self) -> dict[str, Any]:
         """Return safe, user-facing calibration progress without event contents."""
 
         def operation() -> dict[str, Any]:
             with closing(self._connect()) as connection:
-                count = self._difficulty_event_count(connection)
-                row = connection.execute(
-                    "SELECT value FROM meta WHERE key = 'difficulty_model'"
-                ).fetchone()
-                trained = False
-                trained_count = 0
-                baseline: float | None = None
-                if row is not None:
-                    try:
-                        model = json.loads(row["value"])
-                        trained = bool(
-                            isinstance(model, dict)
-                            and model.get("version") == DIFFICULTY_MODEL_VERSION
-                            and int(model.get("epoch_event_id", -1))
-                            == self._difficulty_epoch(connection)
+                return self._difficulty_status_in_connection(connection)
+
+        return self._run_with_recovery(operation)
+
+    def baseline_visualization(self) -> dict[str, Any]:
+        """Read one calibration snapshot; never train or rewrite event predictions."""
+        def operation() -> dict[str, Any]:
+            with closing(self._connect()) as connection:
+                connection.execute("BEGIN")
+                status = self._difficulty_status_in_connection(connection)
+                samples: list[dict[str, Any]] = []
+                if status["trained"]:
+                    model = self._load_difficulty_model(connection)
+                    rows = connection.execute(
+                        """
+                        SELECT event_id, word, pos, meaning, reviewed_at,
+                               target_performance, effective_mastery_before,
+                               attempts_before
+                        FROM review_events
+                        WHERE event_id > ? AND status = 'answered'
+                          AND target_performance IS NOT NULL
+                          AND attribution_confidence >= ? AND meaning_revealed = 0
+                        ORDER BY event_id DESC LIMIT ?
+                        """,
+                        (self._difficulty_epoch(connection), MIN_ATTRIBUTION_CONFIDENCE,
+                         DIFFICULTY_MAX_TRAINING_EVENTS),
+                    ).fetchall()
+                    for row in rows:
+                        sample = dict(row)
+                        sample["expected_performance"] = self._expected_performance(
+                            model, _safe_float(row["effective_mastery_before"]),
+                            int(_safe_float(row["attempts_before"])),
                         )
-                        if trained:
-                            trained_count = max(0, int(model.get("sample_count", 0)))
-                            baseline = min(
-                                1.0,
-                                max(0.0, float(model.get("baseline"))),
-                            )
-                    except (TypeError, ValueError, OverflowError, json.JSONDecodeError):
-                        trained = False
-                next_training_at = (
-                    DIFFICULTY_MIN_GLOBAL_SAMPLES
-                    if not trained
-                    else max(
-                        DIFFICULTY_MIN_GLOBAL_SAMPLES,
-                        trained_count + DIFFICULTY_RETRAIN_INTERVAL,
-                    )
-                )
-                return {
-                    "valid_samples": count,
-                    "trained": trained,
-                    "trained_samples": trained_count,
-                    "baseline": baseline,
-                    "next_training_at": next_training_at,
-                }
+                        samples.append(sample)
+                return {"status": status, "samples": samples}
 
         return self._run_with_recovery(operation)
 

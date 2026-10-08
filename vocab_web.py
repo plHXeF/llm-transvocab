@@ -26,7 +26,8 @@ import streamlit as st
 
 import config
 from app_settings import AppSettings, SettingsError, SettingsStore, default_app_settings
-from domain import Card, Progress, ReviewEvent
+from domain import Card, Progress, ReviewEvent, utc_now
+from learning_charts import baseline_figure, forgetting_figure
 from learning_store import LearningStore
 from llm_service import (
     EVALUATION_PROMPT_VERSION,
@@ -1340,7 +1341,6 @@ def _render_statistics_page(
         )
     if not progress:
         st.info("暂无当前熟练度；重置权重后历史仍会保留，但这里会清空。")
-        return
 
     card_by_id = {card.card_id: card for card in vocabulary.cards}
     rows: list[dict[str, Any]] = []
@@ -1365,10 +1365,74 @@ def _render_statistics_page(
                 "上次复习": _format_local_time(item.last_reviewed_at),
             }
         )
-    mastery_frame = pd.DataFrame(rows).sort_values(
-        ["复习优先级", "单词"], ascending=[False, True]
-    )
-    st.dataframe(mastery_frame, hide_index=True, width="stretch")
+    if rows:
+        mastery_frame = pd.DataFrame(rows).sort_values(
+            ["复习优先级", "单词"], ascending=[False, True]
+        )
+        st.dataframe(mastery_frame, hide_index=True, width="stretch")
+    _render_learning_visualizations(card_by_id, progress, store)
+
+
+def _render_learning_visualizations(
+    cards: dict[str, Card], progress: dict[str, Progress], store: LearningStore,
+) -> None:
+    now = utc_now()
+    with st.expander("遗忘曲线", expanded=False):
+        eligible = [
+            card_id for card_id, item in progress.items()
+            if card_id in cards and item.attempts > 0 and item.last_reviewed_at is not None
+        ]
+        eligible.sort(key=lambda card_id: (-priority_for(progress[card_id], now=now), card_id))
+        if not eligible:
+            st.session_state.pop("forgetting_card", None)
+            st.info("暂无可展示的已复习词条。完成练习后可查看预计遗忘曲线。")
+        else:
+            if st.session_state.get("forgetting_card") not in eligible:
+                st.session_state.forgetting_card = eligible[0]
+            selected = st.selectbox(
+                "查看词条", eligible, key="forgetting_card",
+                format_func=lambda card_id: (
+                    f"{cards[card_id].word} · {cards[card_id].pos} · {cards[card_id].meaning}"
+                ),
+            )
+            days = st.selectbox("预测天数", [7, 30, 90], index=1, key="forgetting_days")
+            item = progress[selected]
+            col1, col2, col3 = st.columns(3)
+            col1.metric("当前保留率", f"{retention_for(item, now=now):.1%}")
+            col2.metric("稳定性", f"{item.stability_days:.2f} 天")
+            col3.markdown("上次复习")
+            col3.write(_format_local_time(item.last_reviewed_at))
+            st.plotly_chart(forgetting_figure(item, days, now=now), width="stretch")
+            st.caption(
+                "曲线是假设期间不复习的模型预测。保留率表示记忆随时间衰减的比例，"
+                "与熟练度不同；实际复习会更新稳定性和曲线。"
+            )
+
+    with st.expander("个人基线", expanded=False):
+        snapshot = store.baseline_visualization()
+        status = snapshot["status"]
+        col1, col2, col3 = st.columns(3)
+        col1.metric("已校准个人基线", f"{status['baseline']:.1%}" if status["trained"] else "—")
+        col2.metric("有效样本", status["valid_samples"])
+        col3.metric("下次校准门槛", f"{status['next_training_at']} 个样本")
+        if not status["trained"]:
+            st.info(
+                f"正在收集有效样本：{status['valid_samples']}/{status['next_training_at']}。"
+                "完成首次校准后显示实际表现与当前模型预期的对比。"
+            )
+        elif not snapshot["samples"]:
+            st.info("当前周期暂无有效样本可供展示。")
+        else:
+            st.plotly_chart(baseline_figure(snapshot["samples"]), width="stretch")
+            st.caption(
+                f"展示当前重置周期内最近 {len(snapshot['samples'])} 个有效样本，包含不同词库的练习。"
+                "预期值统一使用最新已校准模型计算；参考线上方表示实际表现高于预期。"
+            )
+        st.caption(
+            "个人基线是目标词表现指标，与整句翻译平均分不同。"
+            "跳过、查看释义和低置信度归因不参与基线拟合；首次需 30 个有效样本，"
+            "此后每增加 20 个样本后台更新。查看图表不会触发校准。"
+        )
 
 
 def _decode_upload(content: bytes) -> str:
